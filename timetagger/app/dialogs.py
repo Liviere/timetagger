@@ -3309,9 +3309,8 @@ class ReportDialog(BaseDialog):
                 if note and shownotes:
                     note_html = utils.escape_html(note).replace("\n", "<br>")
                     lines.append(
-                        "<tr class='note_row'><td></td><td></td><td></td>"
-                        + "<td></td><td></td><td></td>"
-                        + f"<td class='note'>{note_html}</td></tr>"
+                        "<tr class='note_row'>"
+                        + f"<td class='note' colspan='7'>{note_html}</td></tr>"
                     )
         return lines.join("")
 
@@ -3529,24 +3528,29 @@ class ReportDialog(BaseDialog):
                     # lines, so we check for overflow as we go.
                     note = row[8]
                     if note and shownotes:
+                        # The note uses the full width (only a small indent) and
+                        # a tighter line pitch than the record rows.
+                        note_x = margin + 6
+                        noteheight = 0.7 * rowheight
+                        noteheight2 = 0.5 * noteheight
                         doc.setFontSize(8)
                         w_space = doc.getTextWidth(" ")
                         for paragraph in note.split("\n"):
-                            x = min_x + 3
-                            y += rowheight
-                            if (y + rowheight) > (height - margin):
+                            x = note_x
+                            y += noteheight
+                            if (y + noteheight) > (height - margin):
                                 doc.addPage()
                                 npages += 1
                                 y = margin
                             doc.setFillColor("#f3f3f3" if rownr % 2 else "#eaeaea")
-                            doc.rect(margin, y, width - 2 * margin, rowheight, "F")
+                            doc.rect(margin, y, width - 2 * margin, noteheight, "F")
                             doc.setTextColor("#555")
                             for word in paragraph.split(" "):
                                 w = doc.getTextWidth(word)
                                 if x + w > max_x:  # need new line
-                                    x = min_x + 3
-                                    y += rowheight
-                                    if (y + rowheight) > (height - margin):
+                                    x = note_x
+                                    y += noteheight
+                                    if (y + noteheight) > (height - margin):
                                         doc.addPage()
                                         npages += 1
                                         y = margin
@@ -3554,10 +3558,13 @@ class ReportDialog(BaseDialog):
                                         "#f3f3f3" if rownr % 2 else "#eaeaea"
                                     )
                                     doc.rect(
-                                        margin, y, width - 2 * margin, rowheight, "F"
+                                        margin, y, width - 2 * margin, noteheight, "F"
                                     )
-                                doc.text(word, x, y + rowheight2, left_middle)
+                                doc.text(word, x, y + noteheight2, left_middle)
                                 x += w + w_space
+                        # The loop below advances by a full rowheight; correct
+                        # for that so the note rows leave no unpainted gap.
+                        y += noteheight - rowheight
                         doc.setFontSize(10)
                         doc.setTextColor("#000")
                 else:
