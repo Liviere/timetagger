@@ -18,6 +18,12 @@ def looks_like_desktop():
     return window.screen.width >= 800
 
 
+def escape_html(s):
+    """Escape a string so it can safely be put in innerHTML."""
+    s = s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    return s.replace('"', "&quot;")
+
+
 # From https://github.com/hsluv/hsluv/tree/master/javascript
 # hue is a number between 0 and 360, saturation and lightness are numbers between 0 and 100.
 # returns an array of 3 numbers between 0 and 1, for the r, g, and b channel.
@@ -617,6 +623,7 @@ class SimpleSettings:
             "report_hidesecondary": False,
             "report_format": "hm",
             "report_showrecords": True,
+            "report_shownotes": True,
         }
         self._synced_keys = {
             "first_day_of_week": 1,

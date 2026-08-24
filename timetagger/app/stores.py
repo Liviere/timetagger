@@ -60,6 +60,14 @@ if this_is_js():  # pragma: no cover
         s = String(x).slice(0, STR_MAX)
         return s.replace("\r", "").replace("\n", " ").replace("\t", " ").lstrip(' "')
 
+    def to_text(x):
+        """Like to_str, but for multi-line prose: newlines are preserved
+        (CRLF and CR are normalized to LF) and the length limit is much higher.
+        """
+        global String
+        s = String(x).slice(0, TEXT_MAX - 1)
+        return s.replace("\r\n", "\n").replace("\r", "\n").replace("\t", " ")
+
     def to_jsonable(x):
         return x
 
@@ -72,6 +80,10 @@ else:
     to_float = float
     to_str = str
     to_jsonable = lambda x: x
+
+    def to_text(x):
+        s = str(x)[: TEXT_MAX - 1]
+        return s.replace("\r\n", "\n").replace("\r", "\n").replace("\t", " ")
 
     _dict = dict
 
@@ -127,13 +139,14 @@ _min_heap_bin_size = 2**17  # about 1.5 day
 
 # ----- COMMON PART (don't change this comment)
 
-RECORD_SPEC = dict(key=to_str, mt=to_int, t1=to_int, t2=to_int, ds=to_str)
+RECORD_SPEC = dict(key=to_str, mt=to_int, t1=to_int, t2=to_int, ds=to_str, note=to_text)
 RECORD_REQ = ["key", "mt", "t1", "t2"]
 
 SETTING_SPEC = dict(key=to_str, mt=to_int, value=to_jsonable)
 SETTING_REQ = ["key", "mt", "value"]
 
 STR_MAX = 256
+TEXT_MAX = 4096
 JSON_MAX = 8192
 
 # ----- END COMMON PART (don't change this comment)
@@ -168,6 +181,7 @@ def is_hidden(item):
 def make_hidden(item):
     """Mark the given item as hidden."""
     item.ds = "HIDDEN " + item.get("ds", "").split("HIDDEN")[-1].strip()
+    item.pop("note", None)  # don't keep prose around for deleted records
 
 
 # %% Sub stores

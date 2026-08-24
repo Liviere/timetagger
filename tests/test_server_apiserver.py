@@ -1700,5 +1700,79 @@ def test_version():
         assert r.status == 405
 
 
+def test_records_note():
+    """The optional 'note' field holds multi-line prose, next to the
+    single-line 'ds' that acts as the header.
+    """
+    clear_test_db()
+
+    with MockTestServer(our_api_handler) as p:
+        # A record without a note is accepted and simply has no such field.
+        # This is the backwards compatibility case: old records never get one.
+        records = [dict(key="n1", mt=110, t1=100, t2=150, ds="#p1 header")]
+        r = p.put(
+            "http://localhost/api/v2/records",
+            json.dumps(records).encode(),
+            headers=HEADERS,
+        )
+        assert r.status == 200
+        assert dejsonize(r)["accepted"] == ["n1"]
+        stored = {x["key"]: x for x in get_from_db("records")}
+        assert "note" not in stored["n1"]
+
+        # Newlines survive the roundtrip (unlike in ds, where they are stripped)
+        note = "First line.\n\nSecond paragraph with detail."
+        records = [dict(key="n2", mt=110, t1=100, t2=150, ds="#p1 header", note=note)]
+        r = p.put(
+            "http://localhost/api/v2/records",
+            json.dumps(records).encode(),
+            headers=HEADERS,
+        )
+        assert r.status == 200
+        assert dejsonize(r)["accepted"] == ["n2"]
+        stored = {x["key"]: x for x in get_from_db("records")}
+        assert stored["n2"]["note"] == note
+
+        # Carriage returns are normalized away
+        records = [
+            dict(key="n3", mt=110, t1=100, t2=150, ds="x", note="a\r\nb\rc"),
+        ]
+        r = p.put(
+            "http://localhost/api/v2/records",
+            json.dumps(records).encode(),
+            headers=HEADERS,
+        )
+        assert r.status == 200
+        stored = {x["key"]: x for x in get_from_db("records")}
+        assert stored["n3"]["note"] == "a\nb\nc"
+
+        # A note is allowed to be much longer than ds, but not unbounded
+        records = [
+            dict(key="n4", mt=120, t1=310, t2=350, ds="x", note="y" * 1000),
+            dict(key="n5", mt=120, t1=310, t2=350, ds="x", note="y" * 4096),
+        ]
+        r = p.put(
+            "http://localhost/api/v2/records",
+            json.dumps(records).encode(),
+            headers=HEADERS,
+        )
+        assert r.status == 200
+        assert dejsonize(r)["accepted"] == ["n4"]
+        assert dejsonize(r)["failed"] == ["n5"]
+        assert "less than 4096" in dejsonize(r)["errors"][0]
+
+        # Fields that the server does not know are dropped, the record still lands
+        records = [dict(key="n6", mt=120, t1=310, t2=350, ds="x", nosuchfield="y")]
+        r = p.put(
+            "http://localhost/api/v2/records",
+            json.dumps(records).encode(),
+            headers=HEADERS,
+        )
+        assert r.status == 200
+        assert dejsonize(r)["accepted"] == ["n6"]
+        stored = {x["key"]: x for x in get_from_db("records")}
+        assert "nosuchfield" not in stored["n6"]
+
+
 if __name__ == "__main__":
     run_tests(globals())

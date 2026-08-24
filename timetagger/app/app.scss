@@ -103,6 +103,7 @@ body.darkmode span.keyhint {
 /**************** Tooltip ****************/
 
 .tooltipdiv {
+    max-width: 32em;
     position: absolute;
     pointer-events: none;
     display: block;
@@ -215,7 +216,7 @@ body.darkmode .tooltipdiv {
     }
 }
 
-.dialog input[type=text], .dialog input[type=date], .dialog input[type=time], .dialog input[type=number] {
+.dialog input[type=text], .dialog input[type=date], .dialog input[type=time], .dialog input[type=number], .dialog textarea {
     font-size: 16px; /* at least 16 to prevent mobile browser zooming */
     box-sizing: border-box;
     border: 1px solid #bbb;
@@ -224,9 +225,18 @@ body.darkmode .tooltipdiv {
     color: $prim1_clr;
     padding: 0.3em 0.4em;
 }
-.dialog input:focus {
+.dialog input:focus, .dialog textarea:focus {
     outline: none;
     box-shadow: 0 0 4px rgba(0, 0, 0, 0.4);
+}
+.dialog textarea {
+    width: 100%;
+    resize: vertical;
+    min-height: 4.5em;
+    max-height: 40vh;
+    font-family: inherit;
+    line-height: 1.4;
+    overflow-y: auto;
 }
 .dialog input:focus[type=range] {
     box-shadow: none;
@@ -405,6 +415,13 @@ body.is_read_only button.actionbutton:hover { box-shadow: 0px 2px 2px rgba(0, 0,
     background-color: initial;
     height: 1.5em;
 }
+.dialog table tr.note_row td.note {
+    padding-left: 1.5em;
+    color: #555;
+    font-size: 90%;
+    font-style: italic;
+    white-space: normal;
+}
 @media screen and (min-width: 800px) { .dialog table {
         font-size: 100%;
 }}
@@ -420,4 +437,7 @@ body.darkmode .dialog table tr:nth-child(even) {
 }
 body.darkmode .dialog table tr.blank_row {
     background-color: initial;
+}
+body.darkmode .dialog table tr.note_row td.note {
+    color: #33383d;
 }

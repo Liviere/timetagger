@@ -2301,7 +2301,13 @@ class RecordsWidget(Widget):
                 "key": record.key,
             }
             self._picker.register(x5, ty1, x6, ty2, d)
-            tt_text = tags.join(" ") + "\n(Click to edit)"
+            tt_text = tags.join(" ")
+            note = record.get("note", "")
+            if note:
+                if len(note) > 300:
+                    note = note[:300] + "…"
+                tt_text += "\n\n" + note
+            tt_text += "\n(Click to edit)"
             hover_description = self._canvas.register_tooltip(x5, ty1, x6, ty2, tt_text)
 
         # Cast a shadow if hovering
@@ -2437,7 +2443,8 @@ class RecordsWidget(Widget):
         # Show desciption
         ctx.font = (SMALLER * FONT.size) + "px " + FONT.default
         ctx.textAlign = "left"
-        max_x = x6 - 4
+        has_note = len(record.get("note", "")) > 0
+        max_x = x6 - 18 if has_note else x6 - 4
         space_width = ctx.measureText(" ").width + 2
         x = x5 + 55
         ctx.fillStyle = COLORS.record_text if tags_selected else faded_clr
@@ -2460,6 +2467,13 @@ class RecordsWidget(Widget):
                 else:
                     ctx.fillText("…", x, text_ypos, max_x - x)
                 x = new_x
+
+        # Mark records that carry a note; the prose itself is in the tooltip
+        if has_note:
+            ctx.font = (0.85 * SMALLER * FONT.size) + "px FontAwesome"
+            ctx.textAlign = "right"
+            ctx.fillStyle = faded_clr
+            ctx.fillText("", x6 - 4, text_ypos)
 
     def _draw_selected_record_extras(
         self, ctx, record, t1, x1, x4, x6, y0, y1, y2, npixels, nsecs, yy

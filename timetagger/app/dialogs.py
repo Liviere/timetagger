@@ -31,6 +31,10 @@ def to_str(x):
     return window.stores.to_str(x)
 
 
+def to_text(x):
+    return window.stores.to_text(x)
+
+
 def show_background_div(show, keep_transparent=False):
     # Create element?
     if not window.dialogbackdiv:
@@ -1622,6 +1626,10 @@ class RecordDialog(BaseDialog):
             </div>
             <div></div>
             <div style='color:#777;'></div>
+            <h2><i class='fas'>\uf249</i>&nbsp;&nbsp;Notes</h2>
+            <div class='container'>
+                <textarea rows='3' spellcheck='true'></textarea>
+            </div>
             <h2><i class='fas'>\uf017</i>&nbsp;&nbsp;Time</h2>
             <div></div>
             <div style='margin-top:2em;'></div>
@@ -1643,6 +1651,8 @@ class RecordDialog(BaseDialog):
             self._preset_container,
             self._tags_div,
             self._tag_hints_div,
+            self._note_header,
+            self._note_container,
             _,  # Time header
             self._time_node,
             _,  # Splitter
@@ -1652,6 +1662,7 @@ class RecordDialog(BaseDialog):
         #
         self._ds_input = self._ds_container.children[0]
         self._autocompleter_div = self._ds_container.children[1]
+        self._note_input = self._note_container.children[0]
         self._recent_but = self._preset_container.children[3]
         self._tags_but = self._preset_container.children[2]
         self._preset_but = self._preset_container.children[1]
@@ -1677,6 +1688,11 @@ class RecordDialog(BaseDialog):
 
         # Set some initial values
         self._ds_input.value = record.get("ds", "")
+        self._note_input.value = record.get("note", "")
+        self._note_input.setAttribute(
+            "placeholder",
+            "Longer context (optional). Tags only work in the description.",
+        )
         self._show_tags_from_ds()
         self._delete_but2.style.display = "none"
         self._no_user_edit_yet = True
@@ -1691,6 +1707,7 @@ class RecordDialog(BaseDialog):
         self._resume_but.onclick = self.resume_record
         self._ds_input.oninput = self._on_user_edit
         self._ds_input.onblur = self._on_user_edit_done
+        self._note_input.oninput = self._on_note_edit
         self._recent_but.onclick = self.show_recent_descriptions
         self._tags_but.onclick = self.show_recent_tags
         self._preset_but.onclick = self.show_presets
@@ -1717,6 +1734,7 @@ class RecordDialog(BaseDialog):
 
         # Almost done. Focus on ds if this looks like desktop; it's anoying on mobile
         super().open(callback)
+        self._autogrow_note()
         if utils.looks_like_desktop():
             self._ds_input.focus()
 
@@ -1784,6 +1802,27 @@ class RecordDialog(BaseDialog):
                 )
             self._ds_input.style.setProperty("outline", "dashed 2px red")
             reset = lambda: self._ds_input.style.setProperty("outline", "")
+            window.setTimeout(reset, 2000)
+
+    def _autogrow_note(self):
+        # Let the textarea grow with its content (bounded by max-height in css)
+        self._note_input.style.height = "auto"
+        self._note_input.style.height = (self._note_input.scrollHeight + 2) + "px"
+
+    def _on_note_edit(self):
+        self._mark_as_edited()
+        self._autogrow_note()
+        # If the text is too long, limit it
+        if len(self._note_input.value) >= stores.TEXT_MAX:
+            self._note_input.value = self._note_input.value.slice(
+                0, stores.TEXT_MAX - 1
+            )
+            if "max" not in self._note_header.innerHTML:
+                self._note_header.innerHTML += (
+                    f" <small>(max {stores.TEXT_MAX - 1} chars)</small>"
+                )
+            self._note_input.style.setProperty("outline", "dashed 2px red")
+            reset = lambda: self._note_input.style.setProperty("outline", "")
             window.setTimeout(reset, 2000)
 
     def show_presets(self, e):
@@ -1882,7 +1921,15 @@ class RecordDialog(BaseDialog):
 
     def _on_key(self, e):
         key = e.key.lower()
-        if self._is_composing:
+        if e.target is self._note_input:
+            # In the notes field enter adds a newline; ctrl/cmd+enter submits
+            if key == "enter" or key == "return":
+                if e.ctrlKey or e.metaKey:
+                    e.preventDefault()
+                    self.submit_soon()
+                return
+            super()._on_key(e)
+        elif self._is_composing:
             pass
         elif self._autocompleter.on_key(e):
             e.stopPropagation()
@@ -1920,6 +1967,12 @@ class RecordDialog(BaseDialog):
         self._record.ds = parts.join("")
         if not self._record.ds:
             self._record.pop("ds", None)
+        # Set record.note (the prose; kept separate from the ds "header")
+        note = to_text(self._note_input.value).strip()
+        if note:
+            self._record.note = note
+        else:
+            self._record.pop("note", None)
         # Prevent multiple timers at once
         if self._record.t1 == self._record.t2:
             self._stop_all_running_records(self._record.t1)
@@ -2755,8 +2808,8 @@ class SearchDialog(BaseDialog):
                         break
                 if not all_tags_ok:
                     continue
-                # Check strings
-                ds = (record.ds or "").lower()
+                # Check strings (the header and the prose are both searched)
+                ds = ((record.ds or "") + " " + record.get("note", "")).lower()
                 all_strings_ok = True
                 for word in pos_words:
                     if word not in ds:
@@ -2899,7 +2952,11 @@ class ReportDialog(BaseDialog):
                                         <option value='h2'>9.12</option>
                                         <option value='h3'>9.123</option>
                                      </select>
-                <div>Details:</div> <label><input type='checkbox' checked /> Show records</label>
+                <div>Details:</div> <div>
+                    <label><input type='checkbox' checked /> Show records</label>
+                    <label style='margin-left:1.5em;'>
+                        <input type='checkbox' checked /> Show notes</label>
+                </div>
                 <button type='button'><i class='fas'>\uf328</i>&nbsp;&nbsp;{self._copybuttext}</button>
                     <div>paste in a spreadsheet</div>
                 <button type='button'><i class='fas'>\uf0ce</i>&nbsp;&nbsp;Save CSV</button>
@@ -2921,7 +2978,9 @@ class ReportDialog(BaseDialog):
         self._groupperiod_select = form.children[7]
         self._hidesecondary_but = form.children[9].children[0]  # inside label
         self._format_but = form.children[11]
-        self._showrecords_but = form.children[13].children[0]  # inside label
+        # Both checkboxes live in one grid cell, so the indices below do not shift
+        self._showrecords_but = form.children[13].children[0].children[0]
+        self._shownotes_but = form.children[13].children[1].children[0]
         self._copy_but = form.children[14]
         self._savecsv_but = form.children[16]
         self._savepdf_but = form.children[18]
@@ -2950,12 +3009,15 @@ class ReportDialog(BaseDialog):
         self._format_but.value = format
         showrecords = window.simplesettings.get("report_showrecords")
         self._showrecords_but.checked = showrecords
+        shownotes = window.simplesettings.get("report_shownotes")
+        self._shownotes_but.checked = shownotes
         #
         self._grouping_select.onchange = self._on_setting_changed
         self._groupperiod_select.onchange = self._on_setting_changed
         self._hidesecondary_but.oninput = self._on_setting_changed
         self._format_but.onchange = self._on_setting_changed
         self._showrecords_but.oninput = self._on_setting_changed
+        self._shownotes_but.oninput = self._on_setting_changed
         #
         self._copy_but.onclick = self._copy_clipboard
         self._savecsv_but.onclick = self._save_as_csv
@@ -2976,6 +3038,7 @@ class ReportDialog(BaseDialog):
         )
         window.simplesettings.set("report_format", self._format_but.value)
         window.simplesettings.set("report_showrecords", self._showrecords_but.checked)
+        window.simplesettings.set("report_shownotes", self._shownotes_but.checked)
         self._update_table()
 
     def _update_table(self):
@@ -3215,6 +3278,7 @@ class ReportDialog(BaseDialog):
                             st2,
                             to_str(record.get("ds", "")),  # strip tabs and newlines
                             window.store.records.tags_from_record(record).join(" "),
+                            record.get("note", ""),  # prose, may contain newlines
                         ]
                     )
 
@@ -3222,6 +3286,7 @@ class ReportDialog(BaseDialog):
 
     def _generate_table_html(self, rows):
         window._open_record_dialog = self._open_record
+        shownotes = self._shownotes_but.checked
         blank_row = "<tr class='blank_row'><td></td><td></td><td></td><td></td><td></td><td></td><td></td></tr>"
         lines = []
         for row in rows:
@@ -3240,6 +3305,14 @@ class ReportDialog(BaseDialog):
                     + f"<td><a onclick='window._open_record_dialog(\"{key}\")' style='cursor:pointer;'>"
                     + f"{ds or '&nbsp;-&nbsp;'}</a></td></tr>"
                 )
+                note = row[8]
+                if note and shownotes:
+                    note_html = utils.escape_html(note).replace("\n", "<br>")
+                    lines.append(
+                        "<tr class='note_row'><td></td><td></td><td></td>"
+                        + "<td></td><td></td><td></td>"
+                        + f"<td class='note'>{note_html}</td></tr>"
+                    )
         return lines.join("")
 
     def _open_record(self, key):
@@ -3279,7 +3352,7 @@ class ReportDialog(BaseDialog):
 
         lines = []
         lines.append(
-            "subtotals,tag_groups,duration,date,start,stop,description,user,tags"
+            "subtotals,tag_groups,duration,date,start,stop,description,user,tags,notes"
         )
         lines.append("")
 
@@ -3291,15 +3364,17 @@ class ReportDialog(BaseDialog):
 
         for row in rows:
             if row[0] == "blank":
-                lines.append(",,,,,,,,")
+                lines.append(",,,,,,,,,")
             elif row[0] == "head":
-                lines.append(RawJS('row[1] + "," + row[2] + ",,,,,,,"'))
+                lines.append(RawJS('row[1] + "," + row[2] + ",,,,,,,,"'))
             elif row[0] == "record":
                 _, key, duration, sd1, st1, st2, ds, tagz = row
                 ds = '"' + ds.replace('"', '""') + '"'
+                # Newlines are kept; inside double quotes that is valid per RFC 4180
+                note = '"' + row[8].replace('"', '""') + '"'  # noqa
                 lines.append(
                     RawJS(
-                        """',,' + duration + ',' + sd1 + ',' + st1 + ',' + st2 + ',' + ds + ',' + user + ',' + tagz"""
+                        """',,' + duration + ',' + sd1 + ',' + st1 + ',' + st2 + ',' + ds + ',' + user + ',' + tagz + ',' + note"""
                     )
                 )
 
@@ -3324,6 +3399,7 @@ class ReportDialog(BaseDialog):
         width, height = 210, 297  # A4
         margin = 20  # mm
         showrecords = self._showrecords_but.checked
+        shownotes = self._shownotes_but.checked
         rowheight = 6
         rowheight2 = rowheight / 2
         rowskip = 3
@@ -3448,6 +3524,42 @@ class ReportDialog(BaseDialog):
                                 doc.setTextColor("#000")
                             doc.text(word, x, y + rowheight2, left_middle)
                             x += w + w_space
+                    # The note goes on its own line(s) below the record. The
+                    # chunk-based page estimate above does not know about these
+                    # lines, so we check for overflow as we go.
+                    note = row[8]
+                    if note and shownotes:
+                        doc.setFontSize(8)
+                        w_space = doc.getTextWidth(" ")
+                        for paragraph in note.split("\n"):
+                            x = min_x + 3
+                            y += rowheight
+                            if (y + rowheight) > (height - margin):
+                                doc.addPage()
+                                npages += 1
+                                y = margin
+                            doc.setFillColor("#f3f3f3" if rownr % 2 else "#eaeaea")
+                            doc.rect(margin, y, width - 2 * margin, rowheight, "F")
+                            doc.setTextColor("#555")
+                            for word in paragraph.split(" "):
+                                w = doc.getTextWidth(word)
+                                if x + w > max_x:  # need new line
+                                    x = min_x + 3
+                                    y += rowheight
+                                    if (y + rowheight) > (height - margin):
+                                        doc.addPage()
+                                        npages += 1
+                                        y = margin
+                                    doc.setFillColor(
+                                        "#f3f3f3" if rownr % 2 else "#eaeaea"
+                                    )
+                                    doc.rect(
+                                        margin, y, width - 2 * margin, rowheight, "F"
+                                    )
+                                doc.text(word, x, y + rowheight2, left_middle)
+                                x += w + w_space
+                        doc.setFontSize(10)
+                        doc.setTextColor("#000")
                 else:
                     doc.setFillColor("#ffeeee")
                     doc.rect(margin, y, width - 2 * margin, rowheight, "F")

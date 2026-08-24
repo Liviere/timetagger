@@ -38,6 +38,16 @@ def to_str(s):
     return s
 
 
+def to_text(s):
+    """Like to_str, but for multi-line prose: newlines are preserved
+    (CRLF and CR are normalized to LF) and the length limit is much higher.
+    """
+    s = str(s).replace("\r\n", "\n").replace("\r", "\n")
+    if len(s) >= TEXT_MAX:
+        raise ValueError("Text values must be less than 4096 chars.")
+    return s
+
+
 def to_jsonable(x):
     s = json.dumps(x)
     if len(s) >= JSON_MAX:
@@ -47,13 +57,14 @@ def to_jsonable(x):
 
 # ----- COMMON PART (don't change this comment)
 
-RECORD_SPEC = dict(key=to_str, mt=to_int, t1=to_int, t2=to_int, ds=to_str)
+RECORD_SPEC = dict(key=to_str, mt=to_int, t1=to_int, t2=to_int, ds=to_str, note=to_text)
 RECORD_REQ = ["key", "mt", "t1", "t2"]
 
 SETTING_SPEC = dict(key=to_str, mt=to_int, value=to_jsonable)
 SETTING_REQ = ["key", "mt", "value"]
 
 STR_MAX = 256
+TEXT_MAX = 4096
 JSON_MAX = 8192
 
 # ----- END COMMON PART (don't change this comment)
