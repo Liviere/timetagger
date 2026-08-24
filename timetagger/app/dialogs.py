@@ -3529,28 +3529,47 @@ class ReportDialog(BaseDialog):
                     note = row[8]
                     if note and shownotes:
                         # The note uses the full width (only a small indent) and
-                        # a tighter line pitch than the record rows.
+                        # a tighter line pitch than the record rows. Only its
+                        # first line gets extra leading, to set it apart from the
+                        # record; that leading is painted along with the line so
+                        # the row fill stays continuous. Note that y is advanced
+                        # by the height of the *previous* line, which is the
+                        # record row (rowheight) for the very first note line.
                         note_x = margin + 6
                         noteheight = 0.7 * rowheight
                         noteheight2 = 0.5 * noteheight
+                        notegap = 0.15 * noteheight  # leading above the note
+                        notepad = 0.35 * noteheight  # padding below the note
+                        lineh = noteheight + notegap  # height of the first line
+                        liney = notegap + noteheight2  # its text baseline
+                        prev_h = rowheight
+                        first_line = True
                         doc.setFontSize(8)
                         w_space = doc.getTextWidth(" ")
                         for paragraph in note.split("\n"):
                             x = note_x
-                            y += noteheight
-                            if (y + noteheight) > (height - margin):
+                            y += prev_h
+                            if first_line:
+                                first_line = False
+                            else:
+                                lineh = noteheight
+                                liney = noteheight2
+                            if (y + lineh) > (height - margin):
                                 doc.addPage()
                                 npages += 1
                                 y = margin
                             doc.setFillColor("#f3f3f3" if rownr % 2 else "#eaeaea")
-                            doc.rect(margin, y, width - 2 * margin, noteheight, "F")
+                            doc.rect(margin, y, width - 2 * margin, lineh, "F")
                             doc.setTextColor("#555")
+                            prev_h = lineh
                             for word in paragraph.split(" "):
                                 w = doc.getTextWidth(word)
                                 if x + w > max_x:  # need new line
                                     x = note_x
-                                    y += noteheight
-                                    if (y + noteheight) > (height - margin):
+                                    y += prev_h
+                                    lineh = noteheight
+                                    liney = noteheight2
+                                    if (y + lineh) > (height - margin):
                                         doc.addPage()
                                         npages += 1
                                         y = margin
@@ -3558,13 +3577,23 @@ class ReportDialog(BaseDialog):
                                         "#f3f3f3" if rownr % 2 else "#eaeaea"
                                     )
                                     doc.rect(
-                                        margin, y, width - 2 * margin, noteheight, "F"
+                                        margin, y, width - 2 * margin, lineh, "F"
                                     )
-                                doc.text(word, x, y + noteheight2, left_middle)
+                                    prev_h = lineh
+                                doc.text(word, x, y + liney, left_middle)
                                 x += w + w_space
+                        # Padding below the last line, painted along so the
+                        # row fill stays continuous. Skip it if the page is full.
+                        if (y + lineh + notepad) > (height - margin):
+                            notepad = 0
+                        else:
+                            doc.setFillColor("#f3f3f3" if rownr % 2 else "#eaeaea")
+                            doc.rect(
+                                margin, y + lineh, width - 2 * margin, notepad, "F"
+                            )
                         # The loop below advances by a full rowheight; correct
                         # for that so the note rows leave no unpainted gap.
-                        y += noteheight - rowheight
+                        y += lineh + notepad - rowheight
                         doc.setFontSize(10)
                         doc.setTextColor("#000")
                 else:
