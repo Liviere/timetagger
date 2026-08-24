@@ -405,6 +405,13 @@ body.is_read_only button.actionbutton:hover { box-shadow: 0px 2px 2px rgba(0, 0,
     content: ' -';
 }
 
+/* The dialog hides horizontal overflow on purpose (no sideways swiping), so a
+   long description in the last column would simply be clipped. Let it wrap. */
+.dialog table td:last-child {
+    white-space: normal;
+    overflow-wrap: break-word;
+}
+
 .dialog table tr {
     background-color: rgb(250,250,250);
 }
