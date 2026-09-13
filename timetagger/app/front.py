@@ -169,6 +169,7 @@ class TimeTaggerCanvas(BaseCanvas):
         self.timeselection_dialog = dialogs.TimeSelectionDialog(self)
         self.settings_dialog = dialogs.SettingsDialog(self)
         self.record_dialog = dialogs.RecordDialog(self)
+        self.switch_dialog = dialogs.SwitchDialog(self)
         self.tag_combo_dialog = dialogs.TagComboDialog(self)
         self.tag_dialog = dialogs.TagDialog(self)
         self.report_dialog = dialogs.ReportDialog(self)
@@ -1299,6 +1300,7 @@ class TopWidget(Widget):
 
         start_tt = "Start recording [s]"
         stop_tt = "Stop recording [x]"
+        switch_tt = "Switch thread [a]"
 
         # Define stop summary
         running_summary = ""
@@ -1352,12 +1354,31 @@ class TopWidget(Widget):
                 y,
                 h,
                 h,
-                "fas-\uf04b",
-                "record_start",
-                start_tt,
+                "fas-\uf362",
+                "record_switch",
+                switch_tt,
                 {"ref": "topright", "font": FONT.condensed},
             )
             x -= dx
+            # Omit the start button if there is not enough space, the switch
+            # dialog can also start a new thread.
+            space_needed = h + 3
+            if window.simplesettings.get("pomodoro_enabled"):
+                space_needed += h + 3
+            if x - space_needed > 5:
+                x -= 3
+                dx = self._draw_button(
+                    ctx,
+                    x,
+                    y,
+                    h,
+                    h,
+                    "fas-\uf04b",
+                    "record_start",
+                    start_tt,
+                    {"ref": "topright", "font": FONT.condensed},
+                )
+                x -= dx
         else:
             # This but takes more space, but there it no stop but. So no reason
             # to reduce size when avail_width is low.
@@ -1545,6 +1566,8 @@ class TopWidget(Widget):
                 self._handle_button_press("record_start")
         elif e.key.lower() == "x":
             self._handle_button_press("record_stopall")
+        elif e.key.lower() == "a":
+            self._handle_button_press("record_switch_last")
         elif e.key.lower() == "r":
             self._handle_button_press("report")
         elif e.key.lower() == "i":
@@ -1619,12 +1642,12 @@ class TopWidget(Widget):
                     record.t2 = max(record.t1 + 2, now)
                     self._canvas.record_dialog.open("Stop", record, self.update)
             elif action == "record_stopall":
-                records = window.store.records.get_running_records()
-                for record in records:
-                    record.t2 = max(record.t1 + 2, now)
-                    window.store.records.put(record)
-                if window.simplesettings.get("pomodoro_enabled"):
-                    self._canvas.pomodoro_dialog.stop()
+                dialogs.stop_running_records(self._canvas, True)
+            elif action == "record_switch":
+                self._canvas.switch_dialog.open(self.update)
+            elif action == "record_switch_last":
+                if not dialogs.switch_to_previous_thread(self._canvas):
+                    self._canvas.switch_dialog.open(self.update)
 
         elif action.startswith("nav_"):
             # A navigation action

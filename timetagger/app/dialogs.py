@@ -306,6 +306,33 @@ def switch_to_previous_thread(canvas):
     return False
 
 
+def stop_running_records(canvas, offer_consolidation=False):
+    """Stop all running records, at the same second."""
+    now = int(dt.now())
+    records = window.store.records.get_running_records()
+    for record in records:
+        record.t2 = max(record.t1 + 2, now)
+    if len(records) > 0:
+        window.store.records.put(*records)
+    if window.simplesettings.get("pomodoro_enabled"):
+        canvas.pomodoro_dialog.stop()
+
+
+def _ds_to_html(ds):
+    """Render a description as (escaped) html, with colored tags."""
+    if not ds:
+        return "<i style='color:#777;'>(no description)</i>"
+    _, parts = utils.get_tags_and_parts_from_string(ds)
+    html = ""
+    for part in parts:
+        if part.startswith("#"):
+            clr = window.store.settings.get_color_for_tag(part)
+            html += f"<b style='color:{clr};'>#</b>" + utils.escape_html(part[1:])
+        else:
+            html += utils.escape_html(part)
+    return html
+
+
 class BaseDialog:
     """A dialog is widget that is shown as an overlay over the main application.
     Interaction with the application is disabled.
@@ -2120,6 +2147,165 @@ class RecordDialog(BaseDialog):
             return
         if event.action == "stop":
             self._stop_all_running_records()
+
+
+class SwitchDialog(BaseDialog):
+    """Dialog to switch the timer to another thread (description), e.g. to
+    go back and forth between tasks when multitasking.
+    """
+
+    MAX_RECENT = 8
+
+    def open(self, callback=None):
+        now = int(dt.now())
+        running = window.store.records.get_running_records()
+        running.sort(key=lambda r: r.t1)
+        current = running[-1] if len(running) > 0 else None
+
+        # The threads of the current session come first, then recent ones
+        records = window.store.records.get_records(now - 14 * 86400, now + 1).values()
+        session_threads = []
+        listed = {}
+        if current is not None:
+            listed["ds:" + current.get("ds", "")] = True
+            chain = utils.get_record_chain(
+                records, current.key, utils.CHAIN_MAX_GAP, now
+            )
+            session_threads = utils.list_session_threads(chain, now)
+
+        self._threads = []
+        session_html = ""
+        for thread in session_threads:
+            if ("ds:" + thread.ds) not in listed:
+                listed["ds:" + thread.ds] = True
+                meta = dt.duration_string(thread.total, False)
+                session_html += self._thread_html(thread, meta)
+        recent_html = ""
+        n_recent = 0
+        for thread in utils.list_session_threads(records, now):
+            if n_recent < self.MAX_RECENT and ("ds:" + thread.ds) not in listed:
+                listed["ds:" + thread.ds] = True
+                n_recent += 1
+                n_days = days_ago(thread.last_end)
+                if n_days == 0:
+                    meta = "today"
+                elif n_days == 1:
+                    meta = "yesterday"
+                else:
+                    meta = f"{n_days} days ago"
+                recent_html += self._thread_html(thread, meta)
+
+        list_html = ""
+        if session_html:
+            list_html += "<div class='divider'>This session</div>" + session_html
+        if recent_html:
+            list_html += "<div class='divider'>Recent</div>" + recent_html
+        if not list_html:
+            list_html = "<p>No other threads yet. Start one with 'New thread'.</p>"
+
+        if current is not None:
+            elapsed = dt.duration_string(now - current.t1, True)
+            ds_html = _ds_to_html(current.get("ds", ""))
+            current_html = f"Now: {ds_html} &nbsp;·&nbsp; {elapsed}"
+        else:
+            current_html = "No timer is running. Pick a thread to start it."
+
+        html = f"""
+            <h1><i class='fas'>\uf362</i>&nbsp;&nbsp;Switch thread
+                <button type='button'><i class='fas'>\uf00d</i></button>
+            </h1>
+            <p>{current_html}</p>
+            <div class='threadlist'>{list_html}</div>
+            <div style='margin-top:2em;'></div>
+            <div style='display: flex;justify-content: flex-end;'>
+                <button type='button' class='actionbutton'><i class='fas'>\uf00d</i>&nbsp;&nbsp;Cancel</button>
+                <button type='button' class='actionbutton'><i class='fas'>\uf04d</i>&nbsp;&nbsp;Stop</button>
+                <button type='button' class='actionbutton'><i class='fas'>\uf067</i>&nbsp;&nbsp;New thread</button>
+            </div>
+        """
+        self.maindiv.innerHTML = html
+        (
+            h1,
+            _,  # current thread
+            self._list_div,
+            _,  # spacer
+            buttons,
+        ) = self.maindiv.children
+        close_but = h1.children[-1]
+        cancel_but, stop_but, new_but = buttons.children
+        close_but.onclick = self.close
+        cancel_but.onclick = self.close
+        stop_but.onclick = self._stop
+        new_but.onclick = self._new_thread
+        if current is None:
+            stop_but.style.display = "none"
+
+        window._switch_dialog_select = self._select
+        self._active = 0 if len(self._threads) > 0 else -1
+        self._update_active()
+        super().open(callback)
+
+    def _thread_html(self, thread, meta):
+        i = len(self._threads)
+        self._threads.append(thread)
+        keyhint = ""
+        if i < 9 and utils.looks_like_desktop():
+            keyhint = f"<span class='keyhint'>{i + 1}</span>&nbsp; "
+        note_icon = ""
+        if thread.note:
+            note_icon = " &nbsp;<i class='fas' style='color:#999;'>\uf249</i>"
+        ds_html = _ds_to_html(thread.ds)
+        return f"""
+            <a onclick='window._switch_dialog_select({i})'>
+                <span class='meta'>{meta}</span>{keyhint}{ds_html}{note_icon}
+            </a>
+            """
+
+    def _update_active(self):
+        rows = self._list_div.querySelectorAll("a")
+        for i in range(len(rows)):
+            if i == self._active:
+                rows[i].classList.add("active")
+            else:
+                rows[i].classList.remove("active")
+
+    def _on_key(self, e):
+        key = e.key.lower()
+        n = len(self._threads)
+        if key == "arrowdown" or key == "arrowup":
+            e.preventDefault()
+            if n > 0:
+                step = 1 if key == "arrowdown" else n - 1
+                self._active = (self._active + step) % n
+                self._update_active()
+        elif key == "enter" or key == "return":
+            e.preventDefault()
+            if self._active >= 0:
+                self._select(self._active)
+        elif len(key) == 1 and key in "123456789" and int(key) <= n:
+            e.preventDefault()
+            self._select(int(key) - 1)
+        else:
+            super()._on_key(e)
+
+    def _select(self, i):
+        thread = self._threads[i]
+        was_running = len(window.store.records.get_running_records()) > 0
+        action = switch_to_thread(self._canvas, thread.ds, thread.note)
+        self.close()
+        if action and not was_running:
+            if window.simplesettings.get("pomodoro_enabled"):
+                self._canvas.pomodoro_dialog.start_work()
+
+    def _stop(self):
+        self.close()
+        stop_running_records(self._canvas, True)
+
+    def _new_thread(self):
+        self.close()
+        now = dt.now()
+        record = window.store.records.create(now, now)
+        self._canvas.record_dialog.open("Start", record)
 
 
 class TargetHelper:
@@ -4163,6 +4349,7 @@ class SettingsDialog(BaseDialog):
             "S": "Start the timer or add an earlier record",
             "Shift+S": "Resume the current/previous record",
             "X": "Stop the timer",
+            "A": "Switch to the previous thread",
             "F": "Open search dialog",
             "T": "Select time range",
             "R": "Open report dialog",
