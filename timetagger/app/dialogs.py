@@ -307,7 +307,9 @@ def switch_to_previous_thread(canvas):
 
 
 def stop_running_records(canvas, offer_consolidation=False):
-    """Stop all running records, at the same second."""
+    """Stop all running records, at the same second. Optionally offer to
+    consolidate the session that just ended (if the user setting allows).
+    """
     now = int(dt.now())
     records = window.store.records.get_running_records()
     for record in records:
@@ -316,6 +318,68 @@ def stop_running_records(canvas, offer_consolidation=False):
         window.store.records.put(*records)
     if window.simplesettings.get("pomodoro_enabled"):
         canvas.pomodoro_dialog.stop()
+    if offer_consolidation and len(records) > 0:
+        if window.simplesettings.get("multitask_offer_consolidation"):
+            records.sort(key=lambda r: r.t1)
+            canvas.consolidate_dialog.open(records[-1].key, True)
+
+
+def get_consolidation_blocks(key, whole_chain=False):
+    """Get the blocks of the session of the record with the given key, that
+    are worth consolidating (i.e. where threads are interleaved). If not
+    whole_chain, only the block that contains the record is considered. Each
+    block is a dict with records, plan, and reason (why it cannot be
+    consolidated, or an empty string).
+    """
+    record = window.store.records.get_by_key(key)
+    if record is None or stores.is_hidden(record):
+        return []
+    now = int(dt.now())
+    gap = utils.CHAIN_MAX_GAP
+
+    # Get the chain, from a time range that is large enough to contain it
+    margin = 86400
+    while True:
+        t1 = record.t1 - margin
+        t2 = max(record.t2, now if record.t1 == record.t2 else 0) + margin
+        records = window.store.records.get_records(t1, t2).values()
+        chain = utils.get_record_chain(records, key, gap, now)
+        if len(chain) == 0:
+            return []
+        chain_t2 = 0
+        for r in chain:
+            chain_t2 = max(chain_t2, now if r.t1 == r.t2 else r.t2)
+        if chain[0].t1 - gap > t1 and chain_t2 + gap < t2:
+            break
+        elif margin >= 16 * 86400:
+            break
+        margin *= 2
+
+    blocks = []
+    for block_records in utils.split_chain_into_blocks(chain, now):
+        if not whole_chain:
+            keys = [r.key for r in block_records]
+            if key not in keys:
+                continue
+        plan = utils.plan_consolidation(block_records, stores.TEXT_MAX - 1)
+        if not plan.checkerboard:
+            continue
+        reason = ""
+        for r in block_records:
+            if r.t1 == r.t2:
+                reason = "This session is still running. Stop the timer first."
+        if not reason and len(plan.removed) > 0:
+            reason = "Some records are completely overlapped by other records. "
+            reason += "Please fix these overlaps first."
+        blocks.append({"records": block_records, "plan": plan, "reason": reason})
+    return blocks
+
+
+def _time_str(t, with_date=False):
+    date, time = dt.time2localstr(t).split(" ")
+    if with_date:
+        return dt.format_isodate(date) + " " + time[:5]
+    return time[:5]
 
 
 def _ds_to_html(ds):
@@ -1744,6 +1808,7 @@ class RecordDialog(BaseDialog):
             </div>
             <h2><i class='fas'>\uf017</i>&nbsp;&nbsp;Time</h2>
             <div></div>
+            <div style='display:none; margin-top:1em;'></div>
             <div style='margin-top:2em;'></div>
             <div style='display: flex;justify-content: flex-end;'>
                 <button type='button' class='actionbutton'><i class='fas'>\uf00d</i>&nbsp;&nbsp;Cancel</button>
@@ -1767,6 +1832,7 @@ class RecordDialog(BaseDialog):
             self._note_container,
             _,  # Time header
             self._time_node,
+            self._multitask_div,
             _,  # Splitter
             self._buttons,
             self._delete_but2,
@@ -1808,6 +1874,20 @@ class RecordDialog(BaseDialog):
         self._show_tags_from_ds()
         self._delete_but2.style.display = "none"
         self._no_user_edit_yet = True
+
+        # Offer to consolidate the multitasking session this record is part of
+        if mode.lower() == "edit" and record.t1 != record.t2:
+            blocks = get_consolidation_blocks(record.key)
+            if len(blocks) > 0:
+                plan = blocks[0].plan
+                self._multitask_div.innerHTML = f"""
+                    <i class='fas' style='color:#999;'>\uf5fd</i>&nbsp;
+                    Part of a multitasking session: {plan.n_before} records
+                    in {plan.n_threads} threads.
+                    <a style='cursor:pointer; text-decoration:underline;'>Consolidate</a>
+                    """
+                self._multitask_div.querySelector("a").onclick = self._consolidate
+                self._multitask_div.style.display = "block"
 
         # Show the right buttons
         self._set_mode(mode)
@@ -1900,6 +1980,15 @@ class RecordDialog(BaseDialog):
         if self._no_user_edit_yet:
             self._no_user_edit_yet = False
             self._submit_but.disabled = False
+            self._multitask_div.style.display = "none"
+
+    def _consolidate(self):
+        # Close this dialog first, so it cannot overwrite the consolidated record
+        callback = self._callback
+        self._callback = None
+        key = self._record.key
+        self.close()
+        self._canvas.consolidate_dialog.open(key, False, callback)
 
     def _on_user_edit(self):
         self._mark_as_edited()
@@ -2306,6 +2395,282 @@ class SwitchDialog(BaseDialog):
         now = dt.now()
         record = window.store.records.create(now, now)
         self._canvas.record_dialog.open("Start", record)
+
+
+class ConsolidateDialog(BaseDialog):
+    """Dialog to consolidate a multitasking session: the records of each
+    thread (description) are merged into one contiguous record.
+    """
+
+    def __init__(self, canvas):
+        super().__init__(canvas)
+        self._key = ""
+        self._auto = False
+        self._blocks = []
+        self._snapshot = []
+        self._applied = False
+        self._declined = {}  # signatures of blocks offered but not consolidated
+
+    def open(self, key, auto=False, callback=None):
+        """Open the dialog for the session of the record with the given key.
+        In auto mode (i.e. when the timer was just stopped), all blocks of the
+        session are considered, and the dialog is only shown if there is
+        something to consolidate that the user did not decline before.
+        """
+        self._key = key
+        self._auto = auto
+        self._snapshot = []
+        self._applied = False
+        self._blocks = get_consolidation_blocks(key, auto)
+        if auto:
+            blocks = []
+            for block in self._blocks:
+                if not block.reason:
+                    if not self._declined.get(self._signature(block), False):
+                        blocks.append(block)
+            if len(blocks) == 0:
+                return
+            self._blocks = blocks
+        self._render("")
+        super().open(callback)
+
+    def close(self, e=None):
+        if self._auto and not self._applied:
+            for block in self._blocks:
+                self._declined[self._signature(block)] = True
+        super().close(e)
+
+    def _signature(self, block):
+        parts = [f"{r.key}:{r.t1}:{r.t2}" for r in block.records]
+        return "sig:" + "|".join(parts)
+
+    def _render(self, message):
+        blocks_html = ""
+        for i in range(len(self._blocks)):
+            blocks_html += self._block_html(i, self._blocks[i])
+
+        html = f"""
+            <h1><i class='fas'>\uf5fd</i>&nbsp;&nbsp;Consolidate session
+                <button type='button'><i class='fas'>\uf00d</i></button>
+            </h1>
+            <p></p>
+            <div>{blocks_html}</div>
+            <div style='margin-top:1em;'></div>
+            <div style='display: flex;justify-content: flex-end;'>
+                <button type='button' class='actionbutton'></button>
+                <button type='button' class='actionbutton'><i class='fas'>\uf0e2</i>&nbsp;&nbsp;Undo</button>
+                <button type='button' class='actionbutton submit'><i class='fas'>\uf5fd</i>&nbsp;&nbsp;Consolidate</button>
+            </div>
+        """
+        self.maindiv.innerHTML = html
+        h1, self._message_p, self._blocks_div, _, buttons = self.maindiv.children
+        self._cancel_but, self._undo_but, self._submit_but = buttons.children
+        h1.children[-1].onclick = self.close
+        self._cancel_but.onclick = self.close
+        self._undo_but.onclick = self._undo
+        self._submit_but.onclick = self._apply
+        checkboxes = self._get_checkboxes()
+        for i in range(len(checkboxes)):
+            checkboxes[i].onchange = self._update_buttons
+
+        if message:
+            self._message_p.innerHTML = message
+        elif len(self._blocks) == 0:
+            self._message_p.innerHTML = (
+                "There is nothing to consolidate: in this part of the session, "
+                + "no thread has multiple records."
+            )
+        else:
+            self._message_p.innerHTML = (
+                "The records of each thread are merged into one record. The "
+                + "time per thread stays the same, but the start and end times "
+                + "no longer reflect when the work was actually done."
+            )
+        self._update_buttons()
+
+    def _block_html(self, i, block):
+        plan = block.plan
+        records = block.records
+        t2 = plan.t2
+        for record in records:
+            t2 = max(t2, record.t2)
+        with_date = dt.time2localstr(plan.t1)[:10] != dt.time2localstr(t2)[:10]
+
+        range_text = _time_str(plan.t1, True) + " – " + _time_str(t2, with_date)
+        summary = f"{range_text} &nbsp;·&nbsp; "
+        summary += f"{plan.n_before} → {plan.n_after} records &nbsp;·&nbsp; "
+        summary += dt.duration_string(plan.total, False)
+        if len(self._blocks) > 1:
+            state = " disabled" if block.reason else " checked"
+            summary = f"<label><input type='checkbox' data-index='{i}'{state}> {summary}</label>"
+
+        warnings = []
+        if block.reason:
+            warnings.append(block.reason)
+        if plan.overlap_removed > 0:
+            overlap = dt.duration_string(plan.overlap_removed, True)
+            warnings.append(
+                f"{overlap} of overlapping time is removed; "
+                + "the record that started later keeps that time."
+            )
+        if plan.gaps_removed > 0:
+            gaps = dt.duration_string(plan.gaps_removed, True)
+            warnings.append(f"{gaps} of gaps between records moves to the end.")
+        if plan.notes_truncated:
+            warnings.append("The merged notes are too long and will be truncated.")
+        warnings_html = ""
+        for warning in warnings:
+            warnings_html += f"<div style='color:#955;'><i class='fas'>\uf071</i>&nbsp; {warning}</div>"
+
+        rows_before = ""
+        for record in records:
+            ds_html = _ds_to_html(record.get("ds", ""))
+            if record.get("note", ""):
+                ds_html += " <i class='fas' style='color:#999;'>\uf249</i>"
+            duration = dt.duration_string(record.t2 - record.t1, False)
+            rows_before += f"""<tr><td>{duration}</td>
+                <td class='t1'>{_time_str(record.t1, with_date)}</td>
+                <td class='t2'>{_time_str(record.t2, with_date)}</td>
+                <td style='width:100%;'>{ds_html}</td></tr>"""
+        rows_after = ""
+        for merged in plan.blocks:
+            duration = dt.duration_string(merged.t2 - merged.t1, False)
+            rows_after += f"""<tr><td>{duration}</td>
+                <td class='t1'>{_time_str(merged.t1, with_date)}</td>
+                <td class='t2'>{_time_str(merged.t2, with_date)}</td>
+                <td style='width:100%;'>{_ds_to_html(merged.ds)}</td></tr>"""
+            if merged.note:
+                note_html = utils.escape_html(merged.note).replace("\n", "<br>")
+                rows_after += f"<tr class='note_row'><td class='note' colspan='4'>{note_html}</td></tr>"
+
+        label_style = "margin-top:0.8em; font-size:90%; color:#777;"
+        return f"""
+            <div style='margin-bottom:1.5em;'>
+                <div><b>{summary}</b></div>
+                {warnings_html}
+                <div style='{label_style}'>Before</div>
+                <table>{rows_before}</table>
+                <div style='{label_style}'>After</div>
+                <table>{rows_after}</table>
+            </div>
+            """
+
+    def _get_checkboxes(self):
+        # Note: a NodeList is not an array, so iterate over it using an index
+        return self._blocks_div.querySelectorAll("input[type=checkbox]")
+
+    def _get_selected_blocks(self):
+        if len(self._blocks) == 1:
+            return [] if self._blocks[0].reason else [self._blocks[0]]
+        selected = []
+        checkboxes = self._get_checkboxes()
+        for i in range(len(checkboxes)):
+            if checkboxes[i].checked and not checkboxes[i].disabled:
+                index = int(checkboxes[i].getAttribute("data-index"))
+                selected.append(self._blocks[index])
+        return selected
+
+    def _update_buttons(self):
+        close_icon = "<i class='fas'>\uf00d</i>&nbsp;&nbsp;"
+        if self._applied or len(self._blocks) == 0:
+            self._cancel_but.innerHTML = close_icon + "Close"
+            self._submit_but.style.display = "none"
+        else:
+            self._cancel_but.innerHTML = close_icon + "Keep as is"
+            self._submit_but.style.display = "block"
+            self._submit_but.disabled = len(self._get_selected_blocks()) == 0
+        self._undo_but.style.display = "block" if self._applied else "none"
+
+    def _on_key(self, e):
+        key = e.key.lower()
+        if key == "enter" or key == "return":
+            e.preventDefault()
+            if self._applied or self._submit_but.disabled:
+                self.close()
+            else:
+                self._apply()
+        else:
+            super()._on_key(e)
+
+    def _apply(self):
+        if window.store.is_read_only or self._applied:
+            return
+        blocks = self._get_selected_blocks()
+        if len(blocks) == 0:
+            return
+
+        # Make sure that the records did not change since the plan was made
+        for block in blocks:
+            for record in block.records:
+                current = window.store.records.get_by_key(record.key)
+                if (
+                    current is None
+                    or current.mt != record.mt
+                    or current.t1 != record.t1
+                    or current.t2 != record.t2
+                ):
+                    self._blocks = get_consolidation_blocks(self._key, self._auto)
+                    self._render("The records have changed. Please review again.")
+                    return
+
+        items = []
+        snapshot = []
+        n_before = 0
+        n_after = 0
+        for block in blocks:
+            plan = block.plan
+            records_by_key = {}
+            for record in block.records:
+                records_by_key[record.key] = record
+                snapshot.append(record.copy())
+            # Check that the new records are contiguous and keep the total time
+            t = plan.t1
+            for merged in plan.blocks:
+                if merged.t1 != t or merged.t2 <= merged.t1:
+                    console.warn("Refusing to consolidate an inconsistent plan")
+                    return
+                t = merged.t2
+            if t - plan.t1 != plan.total:
+                console.warn("Refusing to consolidate an inconsistent plan")
+                return
+            # Update the records to keep, and hide the others
+            for merged in plan.blocks:
+                record = records_by_key[merged.key].copy()
+                record.t1 = merged.t1
+                record.t2 = merged.t2
+                if merged.note:
+                    record.note = merged.note
+                else:
+                    record.pop("note", None)
+                items.append(record)
+            for key in plan.hide:
+                record = records_by_key[key].copy()
+                stores.make_hidden(record)
+                record.t2 = record.t1 + 1  # t1 == t2 means running
+                items.append(record)
+            n_before += plan.n_before
+            n_after += plan.n_after
+
+        window.store.records.put(*items)
+        self._snapshot = snapshot
+        self._applied = True
+        checkboxes = self._get_checkboxes()
+        for i in range(len(checkboxes)):
+            checkboxes[i].disabled = True
+        self._message_p.innerHTML = (
+            f"Consolidated {n_before} records into {n_after}. "
+            + "Use Undo to restore the original records."
+        )
+        self._update_buttons()
+
+    def _undo(self):
+        if window.store.is_read_only or not self._applied:
+            return
+        window.store.records.put(*[record.copy() for record in self._snapshot])
+        self._snapshot = []
+        self._applied = False
+        self._blocks = get_consolidation_blocks(self._key, self._auto)
+        self._render("Restored the original records.")
 
 
 class TargetHelper:
@@ -4426,6 +4791,9 @@ class SettingsDialog(BaseDialog):
             <label>
                 <input type='checkbox' checked='true'></input>
                 Show elapsed time below start-button</label>
+            <label style='display:block; margin-top:0.5em;'>
+                <input type='checkbox' checked='true'></input>
+                Offer to consolidate multitasking sessions when stopping the timer</label>
 
             <hr style='margin-top: 1em;' />
 
@@ -4475,6 +4843,7 @@ class SettingsDialog(BaseDialog):
             self._repr_form,
             _,  # Misc header
             self._stopwatch_label,
+            self._consolidate_label,
             _,  # hr
             _,  # Section: per device
             _,  # Appearance header
@@ -4540,6 +4909,12 @@ class SettingsDialog(BaseDialog):
         self._stopwatch_check = self._stopwatch_label.children[0]
         self._stopwatch_check.checked = show_stopwatch
         self._stopwatch_check.onchange = self._on_stopwatch_check
+
+        # Offer consolidation of multitasking sessions
+        offer_consolidation = window.simplesettings.get("multitask_offer_consolidation")
+        self._consolidate_check = self._consolidate_label.children[0]
+        self._consolidate_check.checked = offer_consolidation
+        self._consolidate_check.onchange = self._on_consolidate_check
 
         # Device settings
 
@@ -4630,6 +5005,10 @@ class SettingsDialog(BaseDialog):
     def _on_stopwatch_check(self):
         show_stopwatch = bool(self._stopwatch_check.checked)
         window.simplesettings.set("show_stopwatch", show_stopwatch)
+
+    def _on_consolidate_check(self):
+        offer_consolidation = bool(self._consolidate_check.checked)
+        window.simplesettings.set("multitask_offer_consolidation", offer_consolidation)
 
 
 class GuideDialog(BaseDialog):

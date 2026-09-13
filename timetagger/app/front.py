@@ -170,6 +170,7 @@ class TimeTaggerCanvas(BaseCanvas):
         self.settings_dialog = dialogs.SettingsDialog(self)
         self.record_dialog = dialogs.RecordDialog(self)
         self.switch_dialog = dialogs.SwitchDialog(self)
+        self.consolidate_dialog = dialogs.ConsolidateDialog(self)
         self.tag_combo_dialog = dialogs.TagComboDialog(self)
         self.tag_dialog = dialogs.TagDialog(self)
         self.report_dialog = dialogs.ReportDialog(self)
