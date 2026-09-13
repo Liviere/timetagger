@@ -447,6 +447,237 @@ def timestr2tuple(text):
     return h, m, s
 
 
+# %% Multitasking: sessions of adjacent records, consolidation, overlaps
+#
+# These functions work on plain lists of record dicts, so they can be tested
+# in Python. Records are accessed via subscripts, and dicts that are used as
+# sets get prefixed keys (so that e.g. "constructor" is not found in JS).
+
+# A record that starts at most this many seconds after the previous records
+# ended belongs to the same chain (session).
+CHAIN_MAX_GAP = 120
+
+# Switching away from a running record that is younger than this reuses it.
+SWITCH_REUSE_MAX_AGE = 10
+
+# Overlaps shorter than this are not reported.
+OVERLAP_MIN_SECONDS = 1
+
+
+def _record_end(record, now):
+    """Get the end time of a record; a running record ends now."""
+    if record["t1"] == record["t2"]:
+        return max(record["t1"], now)
+    return record["t2"]
+
+
+def _record_ds(record):
+    return record.get("ds", "") or ""
+
+
+def _sorted_records(records, now):
+    """Get a sorted copy of the list of records: by start time, longer
+    records first, and by key to make the order deterministic.
+    """
+    items = []
+    for record in records:
+        items.append(record)
+    items.sort(key=lambda r: r["key"])
+    items.sort(key=lambda r: -_record_end(r, now))
+    items.sort(key=lambda r: r["t1"])
+    return items
+
+
+def get_record_chain(records, key, max_gap, now):
+    """Get the chain of records that the record with the given key is part
+    of: a sorted list of records in which each record starts at most max_gap
+    seconds after all preceding records have ended. Running records end now.
+    Returns an empty list if there is no record with the given key.
+    """
+    chain = []
+    max_end = 0
+    found = False
+    for record in _sorted_records(records, now):
+        if len(chain) > 0 and record["t1"] > max_end + max_gap:
+            if found:
+                break
+            chain = []
+        end = _record_end(record, now)
+        if len(chain) == 0:
+            max_end = end
+        else:
+            max_end = max(max_end, end)
+        chain.append(record)
+        if record["key"] == key:
+            found = True
+    if not found:
+        return []
+    return chain
+
+
+def split_chain_into_blocks(chain, now):
+    """Split a chain into blocks that can be consolidated independently.
+    A cut is made where no description occurs on both sides, and no record
+    overlaps it. So consecutive work on different threads ends up in
+    separate blocks, and interleaved threads end up in one block.
+    """
+    items = _sorted_records(chain, now)
+    last_index = {}
+    for i in range(len(items)):
+        last_index["ds:" + _record_ds(items[i])] = i
+    blocks = []
+    block = []
+    reach = 0
+    max_end = 0
+    for i in range(len(items)):
+        record = items[i]
+        block.append(record)
+        reach = max(reach, last_index["ds:" + _record_ds(record)])
+        max_end = max(max_end, _record_end(record, now))
+        if reach == i:
+            if i == len(items) - 1 or items[i + 1]["t1"] >= max_end:
+                blocks.append(block)
+                block = []
+    return blocks
+
+
+def plan_consolidation(records, note_max):
+    """Plan the consolidation of a block of finished records into one
+    contiguous record per thread (i.e. per description).
+
+    Where records overlap, the record that started last owns the time (like
+    an interruption). Threads are ordered by their center of mass, and packed
+    from the start of the first record, so that each thread keeps its total
+    duration while moving as little as possible. Gaps move to the end. For
+    each thread the first record is kept (with new times and the merged
+    notes), and the others are to be hidden.
+    """
+    items = _sorted_records(records, 0)
+    n = len(items)
+    plan = {
+        "blocks": [],  # dicts with key, ds, t1, t2, note, record_keys
+        "hide": [],  # keys of the records to hide
+        "removed": [],  # descriptions of threads that have no time left
+        "n_before": n,
+        "n_after": 0,
+        "n_threads": 0,
+        "t1": 0,
+        "t2": 0,
+        "total": 0,
+        "overlap_removed": 0,
+        "gaps_removed": 0,
+        "notes_truncated": False,
+        "is_noop": True,
+        "checkerboard": False,
+    }
+    if n == 0:
+        return plan
+    base = items[0]["t1"]
+
+    # Determine how many seconds each record owns, and its "mass" (the owned
+    # seconds times twice their offset to base, which keeps it integer).
+    points = []
+    owned = []
+    mass = []
+    raw = 0
+    max_end = base
+    for i in range(n):
+        record = items[i]
+        points.append(record["t1"])
+        points.append(record["t2"])
+        owned.append(0)
+        mass.append(0)
+        raw += record["t2"] - record["t1"]
+        max_end = max(max_end, record["t2"])
+    points.sort(key=lambda t: t)
+    covered = 0
+    for j in range(len(points) - 1):
+        a = points[j]
+        b = points[j + 1]
+        if b <= a:
+            continue
+        owner = -1
+        for i in range(n):
+            if items[i]["t1"] <= a and items[i]["t2"] >= b:
+                owner = i
+        if owner >= 0:
+            owned[owner] += b - a
+            mass[owner] += (b - a) * (a + b - 2 * base)
+            covered += b - a
+
+    # Group per thread, in order of first appearance
+    groups = []
+    group_indices = {}
+    records_by_key = {}
+    for i in range(n):
+        record = items[i]
+        records_by_key["key:" + record["key"]] = record
+        ds = _record_ds(record)
+        if ("ds:" + ds) not in group_indices:
+            group_indices["ds:" + ds] = len(groups)
+            groups.append(
+                {"ds": ds, "total": 0, "mass": 0, "record_keys": [], "notes": []}
+            )
+        group = groups[group_indices["ds:" + ds]]
+        group["total"] += owned[i]
+        group["mass"] += mass[i]
+        group["record_keys"].append(record["key"])
+        note = (record.get("note", "") or "").strip()
+        if len(note) > 0 and note not in group["notes"]:
+            group["notes"].append(note)
+
+    # Order the threads that have time left by their center of mass (the sort
+    # is stable, so on a tie the thread that appeared first comes first).
+    live_groups = []
+    for group in groups:
+        if len(group["record_keys"]) >= 2 and len(groups) >= 2:
+            plan["checkerboard"] = True
+        if group["total"] > 0:
+            live_groups.append(group)
+        else:
+            plan["removed"].append(group["ds"])
+    live_groups.sort(key=lambda g: g["mass"] / g["total"])
+
+    # Pack the threads into contiguous blocks
+    t = base
+    kept_keys = {}
+    for group in live_groups:
+        note = "\n".join(group["notes"])
+        if len(note) > note_max:
+            note = note[:note_max].strip()
+            plan["notes_truncated"] = True
+        block = {
+            "key": group["record_keys"][0],
+            "ds": group["ds"],
+            "t1": t,
+            "t2": t + group["total"],
+            "note": note,
+            "record_keys": group["record_keys"],
+        }
+        plan["blocks"].append(block)
+        kept_keys["key:" + block["key"]] = True
+        t += group["total"]
+        record = records_by_key["key:" + block["key"]]
+        record_note = record.get("note", "") or ""
+        if record["t1"] != block["t1"] or record["t2"] != block["t2"]:
+            plan["is_noop"] = False
+        elif record_note != note:
+            plan["is_noop"] = False
+    for i in range(n):
+        if ("key:" + items[i]["key"]) not in kept_keys:
+            plan["hide"].append(items[i]["key"])
+            plan["is_noop"] = False
+
+    plan["n_after"] = len(plan["blocks"])
+    plan["n_threads"] = len(groups)
+    plan["t1"] = base
+    plan["t2"] = t
+    plan["total"] = covered
+    plan["overlap_removed"] = raw - covered
+    plan["gaps_removed"] = (max_end - base) - covered
+    return plan
+
+
 def positions_mean_and_std(positions):
     """Calculate the mean and std for a list of positions."""
     PSCRIPT_OVERLOAD = False  # noqa

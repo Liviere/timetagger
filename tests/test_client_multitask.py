@@ -1,0 +1,352 @@
+"""
+Test the multitasking logic from the utils module: detecting chains (sessions)
+of adjacent records, splitting them into blocks, and planning consolidation.
+These functions also run in JS, so the results are compared against node.
+"""
+
+import json
+import subprocess
+
+import pscript
+from pscript import py2js, evaljs
+
+from _common import run_tests
+from timetagger.app import utils
+
+try:
+    subprocess.check_output([pscript.functions.get_node_exe(), "-v"])
+    HAS_NODE = True
+except Exception:  # pragma: no cover
+    HAS_NODE = False
+
+
+T = 1_700_000_000
+
+
+def rec(key, t1, t2, ds=None, note=None):
+    """Create a record dict with times relative to T."""
+    record = {"key": key, "t1": T + t1, "t2": T + t2}
+    if ds is not None:
+        record["ds"] = ds
+    if note is not None:
+        record["note"] = note
+    return record
+
+
+def keys(records):
+    return [r["key"] for r in records]
+
+
+def block_times(plan):
+    return [(b["key"], b["t1"] - T, b["t2"] - T) for b in plan["blocks"]]
+
+
+# %% Fixtures, as (name, func_name, args)
+
+
+def get_chain_fixtures():
+    records1 = [
+        rec("c", 1320, 1800),
+        rec("a", 0, 600),
+        rec("d", 1921, 2400),
+        rec("b", 600, 1200),
+    ]
+    records2 = [
+        rec("L", 0, 3600),
+        rec("s1", 300, 600),
+        rec("s2", 3000, 3300),
+        rec("s3", 3720, 4200),
+        rec("s4", 4321, 4800),
+    ]
+    records3 = [
+        rec("r", 0, 0),  # running
+        rec("x", 600, 1200),
+        rec("v", -600, -120),
+        rec("w", -1800, -721),
+    ]
+    return [
+        ("chain_a", "get_record_chain", [records1, "a", 120, T]),
+        ("chain_c", "get_record_chain", [records1, "c", 120, T]),
+        ("chain_d", "get_record_chain", [records1, "d", 120, T]),
+        ("chain_unknown", "get_record_chain", [records1, "zz", 120, T]),
+        ("chain_s1", "get_record_chain", [records2, "s1", 120, T]),
+        ("chain_s4", "get_record_chain", [records2, "s4", 120, T]),
+        ("chain_r", "get_record_chain", [records3, "r", 120, T + 3600]),
+        ("chain_w", "get_record_chain", [records3, "w", 120, T + 3600]),
+    ]
+
+
+def get_block_fixtures():
+    names = "X A1 B1 A2 B2 Y C1 D1 C2".split(" ")
+    records1 = []
+    for i in range(len(names)):
+        ds = "#" + names[i][0].lower()
+        records1.append(rec(names[i], i * 600, (i + 1) * 600, ds))
+    records2 = [
+        rec("P", 0, 600, "#p"),
+        rec("Q", 600, 1200, "#q"),
+        rec("R", 900, 1500, "#r"),
+    ]
+    records3 = [
+        rec("S", 0, 0, "#s"),  # running
+        rec("U", 300, 600, "#u"),
+    ]
+    return [
+        ("blocks_interleaved", "split_chain_into_blocks", [records1, T]),
+        ("blocks_overlap", "split_chain_into_blocks", [records2, T]),
+        ("blocks_running", "split_chain_into_blocks", [records3, T + 1800]),
+    ]
+
+
+K = "#kancelaria wdrozenie X"
+P = "#pumox awaria Y"
+
+
+def get_plan_fixtures():
+    records_a = [
+        rec("k1", 0, 3600, K, "etap 1"),
+        rec("p1", 3600, 4800, P, "ticket 42"),
+        rec("k2", 4800, 6000, K),
+        rec("p2", 6000, 7200, P, "ticket 42"),
+        rec("k3", 7200, 27000, K, "etap 2"),
+    ]
+    records_b = [
+        rec("a1", 0, 600, "#a"),
+        rec("b1", 600, 1500, "#b"),
+        rec("a2", 1500, 2400, "#a"),
+        rec("b2", 2400, 3000, "#b"),
+    ]
+    records_c = [rec("a", 0, 3600, "#a"), rec("b", 1200, 1800, "#b")]
+    records_d = [rec("a1", 0, 1800, "#a"), rec("a2", 0, 1800, "#a")]
+    records_e = [rec("x1", 0, 3600, "#x"), rec("y1", 0, 3600, "#y")]
+    records_f = [
+        rec("A1", 0, 600, "#a"),
+        rec("B", 660, 1200, "#b"),
+        rec("A2", 1200, 1800, "#a"),
+    ]
+    records_g = [
+        rec("p1", 0, 2400, P, "ticket 42"),
+        rec("k1", 2400, 27000, K, "etap 1\netap 2"),
+    ]
+    records_h = [
+        rec("A1", 0, 600, "#a", "x"),
+        rec("B1", 600, 1200, "#b"),
+        rec("A2", 1200, 1800, "#a", " y \n"),
+        rec("A3", 1800, 2400, "#a", "x"),
+    ]
+    records_i = [
+        rec("r1", 0, 600),
+        rec("a", 600, 1200, "#a"),
+        rec("r2", 1200, 1800, ""),
+    ]
+    return [
+        ("plan_a", "plan_consolidation", [records_a, 4095]),
+        ("plan_b", "plan_consolidation", [records_b, 4095]),
+        ("plan_c", "plan_consolidation", [records_c, 4095]),
+        ("plan_d", "plan_consolidation", [records_d, 4095]),
+        ("plan_e", "plan_consolidation", [records_e, 4095]),
+        ("plan_f", "plan_consolidation", [records_f, 4095]),
+        ("plan_g", "plan_consolidation", [records_g, 4095]),
+        ("plan_h", "plan_consolidation", [records_h, 4095]),
+        ("plan_h_truncated", "plan_consolidation", [records_h, 2]),
+        ("plan_i", "plan_consolidation", [records_i, 4095]),
+        ("plan_empty", "plan_consolidation", [[], 4095]),
+    ]
+
+
+def run_fixture(fixtures, name):
+    for fixture_name, func_name, args in fixtures:
+        if fixture_name == name:
+            return getattr(utils, func_name)(*args)
+    raise KeyError(name)
+
+
+# %% Tests
+
+
+def test_get_record_chain():
+    fixtures = get_chain_fixtures()
+
+    # Records within the gap belong to the chain, the order of input is irrelevant
+    assert keys(run_fixture(fixtures, "chain_a")) == ["a", "b", "c"]
+    assert keys(run_fixture(fixtures, "chain_c")) == ["a", "b", "c"]
+    # A gap of 121s breaks the chain
+    assert keys(run_fixture(fixtures, "chain_d")) == ["d"]
+    assert run_fixture(fixtures, "chain_unknown") == []
+
+    # A long record keeps the chain connected
+    assert keys(run_fixture(fixtures, "chain_s1")) == ["L", "s1", "s2", "s3"]
+    assert keys(run_fixture(fixtures, "chain_s4")) == ["s4"]
+
+    # A running record ends now
+    assert keys(run_fixture(fixtures, "chain_r")) == ["v", "r", "x"]
+    assert keys(run_fixture(fixtures, "chain_w")) == ["w"]
+
+
+def test_split_chain_into_blocks():
+    fixtures = get_block_fixtures()
+
+    blocks = run_fixture(fixtures, "blocks_interleaved")
+    assert [keys(b) for b in blocks] == [
+        ["X"],
+        ["A1", "B1", "A2", "B2"],
+        ["Y"],
+        ["C1", "D1", "C2"],
+    ]
+
+    # No cut where records overlap
+    blocks = run_fixture(fixtures, "blocks_overlap")
+    assert [keys(b) for b in blocks] == [["P"], ["Q", "R"]]
+
+    # A running record ends now
+    blocks = run_fixture(fixtures, "blocks_running")
+    assert [keys(b) for b in blocks] == [["S", "U"]]
+
+    assert utils.split_chain_into_blocks([], T) == []
+
+
+def test_plan_consolidation_design_example():
+    fixtures = get_plan_fixtures()
+
+    # The short interruptions go first, because that is closest to reality
+    plan = run_fixture(fixtures, "plan_a")
+    assert block_times(plan) == [("p1", 0, 2400), ("k1", 2400, 27000)]
+    assert [b["note"] for b in plan["blocks"]] == ["ticket 42", "etap 1\netap 2"]
+    assert [b["record_keys"] for b in plan["blocks"]] == [
+        ["p1", "p2"],
+        ["k1", "k2", "k3"],
+    ]
+    assert [b["ds"] for b in plan["blocks"]] == [P, K]
+    assert plan["hide"] == ["k2", "p2", "k3"]
+    assert plan["removed"] == []
+    assert plan["n_before"] == 5
+    assert plan["n_after"] == 2
+    assert plan["n_threads"] == 2
+    assert plan["t1"] == T and plan["t2"] == T + 27000
+    assert plan["total"] == 27000
+    assert plan["overlap_removed"] == 0
+    assert plan["gaps_removed"] == 0
+    assert plan["notes_truncated"] is False
+    assert plan["is_noop"] is False
+    assert plan["checkerboard"] is True
+
+    # Consolidating the result again changes nothing
+    plan = run_fixture(fixtures, "plan_g")
+    assert block_times(plan) == [("p1", 0, 2400), ("k1", 2400, 27000)]
+    assert plan["hide"] == []
+    assert plan["is_noop"] is True
+    assert plan["checkerboard"] is False
+
+
+def test_plan_consolidation_keeps_totals():
+    fixtures = get_plan_fixtures()
+
+    plan = run_fixture(fixtures, "plan_b")
+    assert block_times(plan) == [("a1", 0, 1500), ("b1", 1500, 3000)]
+    assert plan["hide"] == ["a2", "b2"]
+    assert plan["checkerboard"] is True
+
+    # Gaps move to the end
+    plan = run_fixture(fixtures, "plan_f")
+    assert block_times(plan) == [("A1", 0, 1200), ("B", 1200, 1740)]
+    assert plan["hide"] == ["A2"]
+    assert plan["gaps_removed"] == 60
+    assert plan["total"] == 1740
+
+    for fixture_name, _, args in fixtures:
+        plan = run_fixture(fixtures, fixture_name)
+        blocks = plan["blocks"]
+        # Blocks are contiguous and add up to the covered time
+        for i in range(1, len(blocks)):
+            assert blocks[i]["t1"] == blocks[i - 1]["t2"]
+        assert sum(b["t2"] - b["t1"] for b in blocks) == plan["total"]
+        raw = sum(r["t2"] - r["t1"] for r in args[0])
+        assert plan["total"] + plan["overlap_removed"] == raw
+        # Every record is either kept or hidden
+        kept = [b["key"] for b in blocks]
+        assert sorted(kept + plan["hide"]) == sorted(keys(args[0]))
+
+
+def test_plan_consolidation_overlaps():
+    fixtures = get_plan_fixtures()
+
+    # The record that started later owns the overlapping time
+    plan = run_fixture(fixtures, "plan_c")
+    assert block_times(plan) == [("b", 0, 600), ("a", 600, 3600)]
+    assert plan["hide"] == []
+    assert plan["overlap_removed"] == 600
+    assert plan["checkerboard"] is False
+
+    # Duplicates of the same thread merge
+    plan = run_fixture(fixtures, "plan_d")
+    assert block_times(plan) == [("a1", 0, 1800)]
+    assert plan["hide"] == ["a2"]
+    assert plan["overlap_removed"] == 1800
+    assert plan["checkerboard"] is False
+
+    # A thread that is completely covered by another thread has no time left
+    plan = run_fixture(fixtures, "plan_e")
+    assert block_times(plan) == [("y1", 0, 3600)]
+    assert plan["hide"] == ["x1"]
+    assert plan["removed"] == ["#x"]
+    assert plan["overlap_removed"] == 3600
+    assert plan["n_threads"] == 2
+
+
+def test_plan_consolidation_notes_and_ties():
+    fixtures = get_plan_fixtures()
+
+    # Notes are stripped, deduplicated and kept in chronological order
+    plan = run_fixture(fixtures, "plan_h")
+    assert block_times(plan) == [("B1", 0, 600), ("A1", 600, 2400)]
+    assert [b["note"] for b in plan["blocks"]] == ["", "x\ny"]
+    assert plan["hide"] == ["A2", "A3"]
+    assert plan["notes_truncated"] is False
+
+    plan = run_fixture(fixtures, "plan_h_truncated")
+    assert [b["note"] for b in plan["blocks"]] == ["", "x"]
+    assert plan["notes_truncated"] is True
+
+    # Records without description form a thread too; on a tie, first come first
+    plan = run_fixture(fixtures, "plan_i")
+    assert block_times(plan) == [("r1", 0, 1200), ("a", 1200, 1800)]
+    assert [b["ds"] for b in plan["blocks"]] == ["", "#a"]
+    assert plan["hide"] == ["r2"]
+    assert plan["checkerboard"] is True
+
+    plan = run_fixture(fixtures, "plan_empty")
+    assert plan["blocks"] == [] and plan["hide"] == []
+    assert plan["is_noop"] is True
+
+
+def test_multitask_functions_in_js():
+    """Check that the compiled JS produces the same results as Python."""
+    if not HAS_NODE:
+        print("skipping tests that use node")
+        return
+
+    funcs = [
+        utils._record_end,
+        utils._record_ds,
+        utils._sorted_records,
+        utils.get_record_chain,
+        utils.split_chain_into_blocks,
+        utils.plan_consolidation,
+    ]
+    js = "\n".join(py2js(func, docstrings=False) for func in funcs)
+
+    fixtures = get_chain_fixtures() + get_block_fixtures() + get_plan_fixtures()
+    calls = []
+    for name, func_name, args in fixtures:
+        call = f"{func_name}(" + ", ".join(json.dumps(arg) for arg in args) + ")"
+        calls.append(f"{json.dumps(name)}: {call}")
+    code = js + "\nconsole.log(JSON.stringify({" + ", ".join(calls) + "}));"
+    js_results = json.loads(evaljs(code, print_result=False))
+
+    for name, func_name, args in fixtures:
+        py_result = json.loads(json.dumps(getattr(utils, func_name)(*args)))
+        assert js_results[name] == py_result, name
+
+
+if __name__ == "__main__":
+    run_tests(globals())
