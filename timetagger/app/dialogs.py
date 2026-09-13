@@ -221,6 +221,91 @@ def csvsplit(s, sep, i=0):
     return parts, i
 
 
+# %% Multitasking
+
+
+def switch_to_thread(canvas, ds, note=""):
+    """Switch the timer to the thread with the given description. Running
+    records stop at the same second that the thread starts. Returns the
+    action that was taken (see utils.plan_thread_switch), or None.
+    """
+    if window.store.is_read_only:
+        return None
+
+    now = int(dt.now())
+    running = window.store.records.get_running_records()
+    recent = window.store.records.get_records(now - 60, now).values()
+    plan = utils.plan_thread_switch(
+        running, recent, ds, now, utils.SWITCH_REUSE_MAX_AGE
+    )
+    if plan.action == "noop":
+        return plan.action
+
+    records_by_key = {}
+    for record in recent:
+        records_by_key[record.key] = record
+    for record in running:
+        records_by_key[record.key] = record
+
+    items = []
+    for key_t2 in plan.stop:
+        record = records_by_key[key_t2[0]]
+        record.t2 = key_t2[1]
+        items.append(record)
+    for key in plan.hide:
+        record = records_by_key[key]
+        stores.make_hidden(record)
+        record.t2 = record.t1 + 1  # t1 == t2 means running
+        items.append(record)
+
+    if plan.action == "new":
+        target = window.store.records.create(now, now, ds)
+    else:
+        target = records_by_key[plan.key]
+    if plan.action == "resume":
+        target.t2 = target.t1  # continue where it left off
+    elif plan.action == "new" or plan.action == "retitle":
+        if ds:
+            target.ds = ds
+        else:
+            target.pop("ds", None)
+        if note:
+            target.note = note
+        else:
+            target.pop("note", None)
+    if plan.action != "keep":
+        items.append(target)
+    window.store.records.put(*items)
+
+    # Move to today, if needed
+    t1, t2 = canvas.range.get_target_range()
+    if not (t1 < now < t2):
+        t1, t2 = canvas.range.get_today_range()
+        canvas.range.animate_range(t1, t2)
+
+    canvas.record_dialog.send_notification(target)
+    return plan.action
+
+
+def switch_to_previous_thread(canvas):
+    """Switch to the most recently active other thread in the session of
+    the running record. Returns False if there is no such thread.
+    """
+    now = int(dt.now())
+    running = window.store.records.get_running_records()
+    if len(running) == 0:
+        return False
+    running.sort(key=lambda r: r.t1)
+    current = running[-1]
+    records = window.store.records.get_records(now - 86400, now + 1).values()
+    chain = utils.get_record_chain(records, current.key, utils.CHAIN_MAX_GAP, now)
+    for thread in utils.list_session_threads(chain, now):
+        if thread.ds != current.get("ds", ""):
+            switch_to_thread(canvas, thread.ds, thread.note)
+            return True
+    return False
+
+
 class BaseDialog:
     """A dialog is widget that is shown as an overlay over the main application.
     Interaction with the application is disabled.
@@ -1990,28 +2075,17 @@ class RecordDialog(BaseDialog):
                 self._canvas.pomodoro_dialog.stop()
 
     def resume_record(self):
-        """Start a new record with the same description."""
+        """Start a new record with the same description and note."""
         # The resume button should only be visible for non-running records, but
         # if (for whatever reason) this gets called, resume will mean leave running.
         if self._record.t1 == self._record.t2:
             return self.submit()
-        # In case other timers are runnning, stop these!
-        self._stop_all_running_records()
-        # Create new record with current description
-        now = dt.now()
-        record = window.store.records.create(now, now)
+        # Switch to this thread, stopping other timers at the same second
         _, parts = utils.get_tags_and_parts_from_string(to_str(self._ds_input.value))
-        record.ds = parts.join("")
-        window.store.records.put(record)
+        note = to_text(self._note_input.value).strip()
+        switch_to_thread(self._canvas, parts.join(""), note)
         # Close the dialog - don't apply local changes
         self.close()
-        # Move to today, if needed
-        t1, t2 = self._canvas.range.get_target_range()
-        if not (t1 < now < t2):
-            t1, t2 = self._canvas.range.get_today_range()
-            self._canvas.range.animate_range(t1, t2)
-        # Notify
-        self.send_notification(record)
         # Start pomo?
         if window.simplesettings.get("pomodoro_enabled"):
             self._canvas.pomodoro_dialog.start_work()

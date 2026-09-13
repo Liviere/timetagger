@@ -154,6 +154,52 @@ def get_plan_fixtures():
     ]
 
 
+def get_thread_fixtures():
+    records = [
+        rec("A1", 0, 600, "#a", "n1"),
+        rec("B1", 600, 1200, "#b"),
+        rec("A2", 1200, 1200, "#a"),  # running
+    ]
+    return [
+        ("threads", "list_session_threads", [records, T + 1500]),
+        ("threads_empty", "list_session_threads", [[], T]),
+    ]
+
+
+def get_switch_fixtures():
+    now = T + 1000
+    r_a = rec("R", 0, 0, "#a")
+    r_b = rec("R", 0, 0, "#b")
+    young_b = rec("R", 995, 995, "#b")
+    just_stopped_a = rec("P", 0, 995, "#a")
+    stopped_a = rec("P", 0, 900, "#a")
+    running_a = rec("Q", 990, 990, "#a")  # running records are not resumed
+    r1_a = rec("R1", 0, 0, "#a")
+    r2_b = rec("R2", 500, 500, "#b")
+    r2_b_young = rec("R2", 999, 999, "#b")
+    almost_young_b = rec("R", 990, 990, "#b")
+    args = lambda running, recent, ds: [running, recent, ds, now, 10]
+    return [
+        ("switch_nothing_running", "plan_thread_switch", args([], [], "#b")),
+        ("switch_new", "plan_thread_switch", args([r_a], [], "#b")),
+        ("switch_same", "plan_thread_switch", args([r_b], [], "#b")),
+        ("switch_retitle", "plan_thread_switch", args([young_b], [], "#c")),
+        (
+            "switch_resume",
+            "plan_thread_switch",
+            args([young_b], [stopped_a, just_stopped_a], "#a"),
+        ),
+        (
+            "switch_no_resume",
+            "plan_thread_switch",
+            args([young_b], [stopped_a, running_a], "#a"),
+        ),
+        ("switch_keep", "plan_thread_switch", args([r1_a, r2_b], [], "#b")),
+        ("switch_multi", "plan_thread_switch", args([r2_b_young, r1_a], [], "#c")),
+        ("switch_not_young", "plan_thread_switch", args([almost_young_b], [], "#c")),
+    ]
+
+
 def run_fixture(fixtures, name):
     for fixture_name, func_name, args in fixtures:
         if fixture_name == name:
@@ -319,6 +365,55 @@ def test_plan_consolidation_notes_and_ties():
     assert plan["is_noop"] is True
 
 
+def test_list_session_threads():
+    fixtures = get_thread_fixtures()
+
+    threads = run_fixture(fixtures, "threads")
+    assert threads == [
+        {
+            "ds": "#a",
+            "note": "n1",
+            "total": 900,
+            "n_records": 2,
+            "last_end": T + 1500,
+            "last_key": "A2",
+        },
+        {
+            "ds": "#b",
+            "note": "",
+            "total": 600,
+            "n_records": 1,
+            "last_end": T + 1200,
+            "last_key": "B1",
+        },
+    ]
+    assert run_fixture(fixtures, "threads_empty") == []
+
+
+def test_plan_thread_switch():
+    fixtures = get_switch_fixtures()
+
+    def check(name, action, key="", stop=(), hide=()):
+        plan = run_fixture(fixtures, name)
+        assert plan["action"] == action, name
+        assert plan["key"] == key, name
+        assert plan["stop"] == [[k, T + t] for k, t in stop], name
+        assert plan["hide"] == list(hide), name
+
+    check("switch_nothing_running", "new")
+    check("switch_new", "new", stop=[("R", 1000)])
+    check("switch_same", "noop", "R")
+    # A young record (e.g. an accidental switch) is renamed ...
+    check("switch_retitle", "retitle", "R")
+    # ... or when going back, the record that just stopped continues
+    check("switch_resume", "resume", "P", hide=["R"])
+    check("switch_no_resume", "retitle", "R")
+    # Multiple running records: keep the one that matches, stop the others
+    check("switch_keep", "keep", "R2", stop=[("R1", 1000)])
+    check("switch_multi", "new", stop=[("R1", 1000), ("R2", 1001)])
+    check("switch_not_young", "new", stop=[("R", 1000)])
+
+
 def test_multitask_functions_in_js():
     """Check that the compiled JS produces the same results as Python."""
     if not HAS_NODE:
@@ -332,10 +427,13 @@ def test_multitask_functions_in_js():
         utils.get_record_chain,
         utils.split_chain_into_blocks,
         utils.plan_consolidation,
+        utils.list_session_threads,
+        utils.plan_thread_switch,
     ]
     js = "\n".join(py2js(func, docstrings=False) for func in funcs)
 
     fixtures = get_chain_fixtures() + get_block_fixtures() + get_plan_fixtures()
+    fixtures += get_thread_fixtures() + get_switch_fixtures()
     calls = []
     for name, func_name, args in fixtures:
         call = f"{func_name}(" + ", ".join(json.dumps(arg) for arg in args) + ")"

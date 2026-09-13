@@ -678,6 +678,87 @@ def plan_consolidation(records, note_max):
     return plan
 
 
+def list_session_threads(records, now):
+    """Get the threads (descriptions) of the given records, most recently
+    active first. Each thread is a dict with ds, note (the most recent
+    non-empty note), total, n_records, last_end and last_key.
+    """
+    threads = []
+    indices = {}
+    for record in _sorted_records(records, now):
+        ds = _record_ds(record)
+        if ("ds:" + ds) not in indices:
+            indices["ds:" + ds] = len(threads)
+            thread = {"ds": ds, "note": "", "total": 0, "n_records": 0}
+            thread["last_end"] = 0
+            thread["last_key"] = ""
+            threads.append(thread)
+        thread = threads[indices["ds:" + ds]]
+        end = _record_end(record, now)
+        thread["total"] += end - record["t1"]
+        thread["n_records"] += 1
+        if end >= thread["last_end"]:
+            thread["last_end"] = end
+            thread["last_key"] = record["key"]
+        note = (record.get("note", "") or "").strip()
+        if len(note) > 0:
+            thread["note"] = note  # records are sorted, so the latest note wins
+    threads.sort(key=lambda thread: -thread["last_end"])
+    return threads
+
+
+def plan_thread_switch(running, recent, ds, now, reuse_max_age):
+    """Plan switching the timer to the thread with the given description.
+
+    Given the running records, and the recently finished records, returns a
+    dict with the action ("noop", "keep", "new", "retitle" or "resume"),
+    the key of the record to act on, the records to stop as [key, t2] pairs,
+    and the keys of records to hide. A running record that is younger than
+    reuse_max_age (e.g. after an accidental switch) is reused: it is renamed,
+    or when switching back to the thread that just stopped, that record is
+    resumed and the young record is hidden.
+    """
+    plan = {"action": "new", "key": "", "stop": [], "hide": []}
+
+    if len(running) == 1:
+        current = running[0]
+        if _record_ds(current) == ds:
+            plan["action"] = "noop"
+            plan["key"] = current["key"]
+        elif now - current["t1"] < reuse_max_age:
+            previous = None
+            for record in recent:
+                if record["t1"] == record["t2"] or _record_ds(record) != ds:
+                    continue
+                if abs(record["t2"] - current["t1"]) <= 2:
+                    if previous is None or record["t2"] > previous["t2"]:
+                        previous = record
+            if previous is None:
+                plan["action"] = "retitle"
+                plan["key"] = current["key"]
+            else:
+                plan["action"] = "resume"
+                plan["key"] = previous["key"]
+                plan["hide"].append(current["key"])
+        else:
+            plan["stop"].append([current["key"], max(current["t1"] + 2, now)])
+        return plan
+
+    # Zero or multiple running records: keep the latest that matches
+    keep = None
+    for record in running:
+        if _record_ds(record) == ds:
+            if keep is None or record["t1"] >= keep["t1"]:
+                keep = record
+    if keep is not None:
+        plan["action"] = "keep"
+        plan["key"] = keep["key"]
+    for record in _sorted_records(running, now):
+        if keep is None or record["key"] != keep["key"]:
+            plan["stop"].append([record["key"], max(record["t1"] + 2, now)])
+    return plan
+
+
 def positions_mean_and_std(positions):
     """Calculate the mean and std for a list of positions."""
     PSCRIPT_OVERLOAD = False  # noqa
