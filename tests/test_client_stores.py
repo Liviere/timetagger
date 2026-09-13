@@ -84,5 +84,22 @@ def test_make_hidden_drops_the_note():
     assert "note" not in record
 
 
+def test_make_hidden_stays_within_the_server_limit():
+    """The server rejects ds of STR_MAX chars or more; a rejected hide would
+    make the record come back on the next sync.
+    """
+    record = stores.RecordStore(None).create(100, 200, "#p1 " + "x" * 251)
+    assert len(record["ds"]) == stores.STR_MAX - 1
+
+    stores.make_hidden(record)
+    assert record["ds"].startswith("HIDDEN ")
+    assert len(record["ds"]) == stores.STR_MAX - 1
+
+    # Hiding again changes nothing
+    ds = record["ds"]
+    stores.make_hidden(record)
+    assert record["ds"] == ds
+
+
 if __name__ == "__main__":
     run_tests(globals())

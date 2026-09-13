@@ -57,7 +57,7 @@ if this_is_js():  # pragma: no cover
 
     def to_str(x):
         global String
-        s = String(x).slice(0, STR_MAX)
+        s = String(x).slice(0, STR_MAX - 1)  # the server requires len < STR_MAX
         return s.replace("\r", "").replace("\n", " ").replace("\t", " ").lstrip(' "')
 
     def to_text(x):
@@ -180,7 +180,8 @@ def is_hidden(item):
 
 def make_hidden(item):
     """Mark the given item as hidden."""
-    item.ds = "HIDDEN " + item.get("ds", "").split("HIDDEN")[-1].strip()
+    ds = "HIDDEN " + item.get("ds", "").split("HIDDEN")[-1].strip()
+    item.ds = ds[: STR_MAX - 1]  # the prefix must not push it over the server limit
     item.pop("note", None)  # don't keep prose around for deleted records
 
 

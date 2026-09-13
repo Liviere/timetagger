@@ -1795,7 +1795,7 @@ class RecordDialog(BaseDialog):
         self._show_tags_from_ds()
         # If the str is too long, limit it
         if len(self._ds_input.value) >= stores.STR_MAX:
-            self._ds_input.value = self._ds_input.value.slice(0, stores.STR_MAX)
+            self._ds_input.value = self._ds_input.value.slice(0, stores.STR_MAX - 1)
             if "max" not in self._ds_header.innerHTML:
                 self._ds_header.innerHTML += (
                     f" <small>(max {stores.STR_MAX - 1} chars)</small>"
