@@ -3590,11 +3590,13 @@ class ReportDialog(BaseDialog):
                     <div>archive or send to a client</div>
             </div>
             <hr />
+            <div style='display:none; color:#955; font-size:90%; line-height:1.6;'></div>
             <table id='report_table'></table>
         """
 
         self.maindiv.innerHTML = html
         self._table_element = self.maindiv.children[-1]
+        self._overlap_div = self.maindiv.children[-2]
         form = self.maindiv.children[1]
 
         # filter text = form.children[1]
@@ -3671,9 +3673,11 @@ class ReportDialog(BaseDialog):
         t2_date = self._t2_date
         if not float(t1_date.split("-")[0]) > 1899:
             self._table_element.innerHTML = ""
+            self._overlap_div.style.display = "none"
             return
         elif not float(t2_date.split("-")[0]) > 1899:
             self._table_element.innerHTML = ""
+            self._overlap_div.style.display = "none"
             return
 
         t1 = str_date_to_time_int(t1_date)
@@ -3683,6 +3687,7 @@ class ReportDialog(BaseDialog):
         self._last_t1, self._last_t2 = t1, t2
         html = self._generate_table_html(self._generate_table_rows(t1, t2))
         self._table_element.innerHTML = html
+        self._update_overlap_warning(t1, t2)
 
         # Configure the table ...
         if self._showrecords_but.checked:
@@ -3942,6 +3947,58 @@ class ReportDialog(BaseDialog):
     def _open_record(self, key):
         record = window.store.records.get_by_key(key)
         self._canvas.record_dialog.open("Edit", record, self._update_table)
+
+    def _update_overlap_warning(self, t1, t2):
+        """Warn about records that overlap, since that time is counted more
+        than once. All records are checked, regardless of the selected tags.
+        This is only shown in the dialog, not in the exports.
+        """
+        max_pairs = 20
+        now = int(dt.now())
+        records = window.store.records.get_records(t1, t2).values()
+        result = utils.find_overlaps(records, t1, t2, now, utils.OVERLAP_MIN_SECONDS)
+        pairs = result.pairs
+        if len(pairs) == 0:
+            self._overlap_div.style.display = "none"
+            self._overlap_div.innerHTML = ""
+            return
+
+        records_by_key = {}
+        for record in records:
+            records_by_key[record.key] = record
+
+        total = dt.duration_string(result.total, True)
+        if len(pairs) == 1:
+            what = "1 pair of records overlaps"
+        else:
+            what = f"{len(pairs)} pairs of records overlap"
+        lines = [
+            f"<i class='fas'>\uf071</i>&nbsp; <b>{what}</b>, so {total} is counted "
+            + "more than once. This includes all records in this date range, "
+            + "regardless of the selected tags."
+        ]
+        for pair in pairs[:max_pairs]:
+            record1 = self._overlap_record_html(records_by_key[pair[0]])
+            record2 = self._overlap_record_html(records_by_key[pair[1]])
+            overlap = dt.duration_string(pair[2], True)
+            lines.append(f"{record1} &nbsp;&harr;&nbsp; {record2} &nbsp;({overlap})")
+        if len(pairs) > max_pairs:
+            lines.append(f"and {len(pairs) - max_pairs} more")
+        self._overlap_div.innerHTML = "<br>".join(lines)
+        self._overlap_div.style.display = "block"
+
+    def _overlap_record_html(self, record):
+        date, time1 = dt.time2localstr(record.t1).split(" ")
+        if record.t1 == record.t2:
+            time2 = "now"
+        else:
+            time2 = dt.time2localstr(record.t2).split(" ")[1][:5]
+        ds_html = _ds_to_html(record.get("ds", ""))
+        onclick = f'window._open_record_dialog("{record.key}")'
+        return (
+            f"{dt.format_isodate(date)} {time1[:5]}–{time2} "
+            + f"<a onclick='{onclick}' style='cursor:pointer;'>{ds_html}</a>"
+        )
 
     def _copy_clipboard(self):
         tools.copy_dom_node(self._table_element)

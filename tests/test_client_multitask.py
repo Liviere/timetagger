@@ -200,6 +200,25 @@ def get_switch_fixtures():
     ]
 
 
+def get_overlap_fixtures():
+    day = [T, T + 86400]
+    touching = [rec("a", 0, 3600), rec("b", 3600, 7200)]
+    simple = [rec("b", 1800, 5400), rec("a", 0, 3600)]
+    triple = [rec("a", 0, 100), rec("b", 10, 20), rec("c", 15, 30)]
+    clipped = [rec("a", -50, 50), rec("b", -40, -10), rec("c", 40, 60)]
+    running = [rec("r", 0, 0), rec("b", 50, 60)]
+    small = [rec("a", 0, 10), rec("b", 8, 20)]
+    return [
+        ("overlap_touching", "find_overlaps", [touching] + day + [T, 1]),
+        ("overlap_simple", "find_overlaps", [simple] + day + [T, 1]),
+        ("overlap_triple", "find_overlaps", [triple] + day + [T, 1]),
+        ("overlap_clipped", "find_overlaps", [clipped, T, T + 100, T, 1]),
+        ("overlap_running", "find_overlaps", [running] + day + [T + 100, 1]),
+        ("overlap_small", "find_overlaps", [small] + day + [T, 5]),
+        ("overlap_empty", "find_overlaps", [[]] + day + [T, 1]),
+    ]
+
+
 def run_fixture(fixtures, name):
     for fixture_name, func_name, args in fixtures:
         if fixture_name == name:
@@ -414,6 +433,25 @@ def test_plan_thread_switch():
     check("switch_not_young", "new", stop=[("R", 1000)])
 
 
+def test_find_overlaps():
+    fixtures = get_overlap_fixtures()
+
+    def check(name, total, pairs):
+        result = run_fixture(fixtures, name)
+        assert result == {"total": total, "pairs": pairs}, name
+
+    check("overlap_touching", 0, [])
+    check("overlap_simple", 1800, [["a", "b", 1800]])
+    check("overlap_triple", 25, [["a", "b", 10], ["a", "c", 15], ["b", "c", 5]])
+    # Only the time within the range counts
+    check("overlap_clipped", 10, [["a", "c", 10]])
+    # A running record ends now
+    check("overlap_running", 10, [["r", "b", 10]])
+    # Small overlaps are not listed, but do count
+    check("overlap_small", 2, [])
+    check("overlap_empty", 0, [])
+
+
 def test_multitask_functions_in_js():
     """Check that the compiled JS produces the same results as Python."""
     if not HAS_NODE:
@@ -429,11 +467,13 @@ def test_multitask_functions_in_js():
         utils.plan_consolidation,
         utils.list_session_threads,
         utils.plan_thread_switch,
+        utils.find_overlaps,
     ]
     js = "\n".join(py2js(func, docstrings=False) for func in funcs)
 
     fixtures = get_chain_fixtures() + get_block_fixtures() + get_plan_fixtures()
     fixtures += get_thread_fixtures() + get_switch_fixtures()
+    fixtures += get_overlap_fixtures()
     calls = []
     for name, func_name, args in fixtures:
         call = f"{func_name}(" + ", ".join(json.dumps(arg) for arg in args) + ")"

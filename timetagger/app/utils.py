@@ -759,6 +759,42 @@ def plan_thread_switch(running, recent, ds, now, reuse_max_age):
     return plan
 
 
+def find_overlaps(records, t1, t2, now, min_overlap):
+    """Find records that overlap within the range t1-t2 (running records
+    end now). Returns a dict with the total number of seconds that is counted
+    more than once, and pairs [key1, key2, seconds] of records that overlap
+    at least min_overlap seconds, where record key1 started first.
+    """
+    items = []
+    raw = 0
+    for record in records:
+        a = max(record["t1"], t1)
+        b = min(_record_end(record, now), t2)
+        if b > a:
+            items.append({"key": record["key"], "t1": a, "t2": b})
+            raw += b - a
+    items.sort(key=lambda item: item["key"])
+    items.sort(key=lambda item: item["t1"])
+
+    pairs = []
+    active = []
+    union = 0
+    union_end = 0
+    for item in items:
+        still_active = []
+        for other in active:
+            if other["t2"] > item["t1"]:
+                still_active.append(other)
+                overlap = min(other["t2"], item["t2"]) - item["t1"]
+                if overlap >= min_overlap:
+                    pairs.append([other["key"], item["key"], overlap])
+        still_active.append(item)
+        active = still_active
+        union += max(0, item["t2"] - max(item["t1"], union_end))
+        union_end = max(union_end, item["t2"])
+    return {"total": raw - union, "pairs": pairs}
+
+
 def positions_mean_and_std(positions):
     """Calculate the mean and std for a list of positions."""
     PSCRIPT_OVERLOAD = False  # noqa
