@@ -139,6 +139,13 @@ def get_plan_fixtures():
         rec("a", 600, 1200, "#a"),
         rec("r2", 1200, 1800, ""),
     ]
+    # Switching back to a thread copies its note, which is then added to
+    records_j = [
+        rec("A1", 0, 600, "#a", "etap 1"),
+        rec("B1", 600, 1200, "#b", "ticket 4"),
+        rec("A2", 1200, 1800, "#a", "etap 1\netap 2"),
+        rec("B2", 1800, 2400, "#b", "ticket 42"),
+    ]
     return [
         ("plan_a", "plan_consolidation", [records_a, 4095]),
         ("plan_b", "plan_consolidation", [records_b, 4095]),
@@ -150,6 +157,7 @@ def get_plan_fixtures():
         ("plan_h", "plan_consolidation", [records_h, 4095]),
         ("plan_h_truncated", "plan_consolidation", [records_h, 2]),
         ("plan_i", "plan_consolidation", [records_i, 4095]),
+        ("plan_j", "plan_consolidation", [records_j, 4095]),
         ("plan_empty", "plan_consolidation", [[], 4095]),
     ]
 
@@ -372,6 +380,14 @@ def test_plan_consolidation_notes_and_ties():
     assert [b["note"] for b in plan["blocks"]] == ["", "x"]
     assert plan["notes_truncated"] is True
 
+    # A note that another note extends is not repeated
+    plan = run_fixture(fixtures, "plan_j")
+    assert block_times(plan) == [("A1", 0, 1200), ("B1", 1200, 2400)]
+    assert [b["note"] for b in plan["blocks"]] == [
+        "etap 1\netap 2",
+        "ticket 4\nticket 42",
+    ]
+
     # Records without description form a thread too; on a tie, first come first
     plan = run_fixture(fixtures, "plan_i")
     assert block_times(plan) == [("r1", 0, 1200), ("a", 1200, 1800)]
@@ -462,6 +478,7 @@ def test_multitask_functions_in_js():
         utils._record_end,
         utils._record_ds,
         utils._sorted_records,
+        utils.merge_notes,
         utils.get_record_chain,
         utils.split_chain_into_blocks,
         utils.plan_consolidation,

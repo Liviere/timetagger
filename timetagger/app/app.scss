@@ -438,6 +438,16 @@ body.darkmode .dialog .threadlist a .meta, body.darkmode .dialog .threadlist .di
 .dialog table td.t1::after {
     content: ' -';
 }
+/* A record that joins records separated by breaks. As a pseudo-element, the
+   icon is not included when copying the table. */
+.dialog table td.t2.breaks::after {
+    content: '\f04c';
+    font-family: 'FontAwesome';
+    font-weight: 900;
+    font-size: 70%;
+    margin-left: 0.5em;
+    color: #888;
+}
 
 /* The dialog hides horizontal overflow on purpose (no sideways swiping), so a
    long description in the last column would simply be clipped. Let it wrap. */

@@ -375,11 +375,141 @@ def get_consolidation_blocks(key, whole_chain=False):
     return blocks
 
 
+def get_day_range(t):
+    """Get the start and end time of the (local) day that contains t."""
+    t1 = dt.floor(t, "1D")
+    return t1, dt.add(t1, "1D")
+
+
+def get_break_series(key):
+    """Get the series of records that are only separated by breaks that the
+    record with the given key is part of (see utils.find_break_series).
+    """
+    record = window.store.records.get_by_key(key)
+    if record is None or stores.is_hidden(record):
+        return None
+    day_t1, day_t2 = get_day_range(record.t1)
+    records = window.store.records.get_records(day_t1, day_t2).values()
+    now = int(dt.now())
+    for series in utils.find_break_series(records, [day_t1, day_t2], now):
+        if key in series.record_keys:
+            return series
+    return None
+
+
+def get_merge_plan(ds, t, merge_keys):
+    """Plan merging records of the thread with the given description into the
+    longest record of that thread, on the day that contains t (see
+    utils.plan_record_merge). Returns the plan and the records it is based on.
+    """
+    day_t1, day_t2 = get_day_range(t)
+    # Records that start on this day can end on the next
+    records = window.store.records.get_records(day_t1, dt.add(day_t2, "1D"))
+    records = records.values()
+    now = int(dt.now())
+    note_max = stores.TEXT_MAX - 1
+    plan = utils.plan_record_merge(
+        records, ds, merge_keys, day_t1, day_t2, now, note_max
+    )
+    return plan, records
+
+
+def _merge_signature(plan):
+    """Get a string that identifies what a merge plan would change."""
+    parts = [plan.reason, plan.anchor_key]
+    if plan.anchor is not None:
+        parts.append(f"{plan.anchor.t1}:{plan.anchor.t2}:{plan.anchor.note}")
+    for s in plan.shifted:
+        parts.append(f"{s.key}:{s.t1}:{s.t2}")
+    parts.append(",".join(plan.hide))
+    return "|".join(parts)
+
+
+def _merge_result_is_valid(records, items, plan, now):
+    """Check that the changed records (items) do not overlap within the range
+    of the plan, and that every thread keeps its total time.
+    """
+    changed = {}
+    for item in items:
+        changed["key:" + item.key] = item
+    totals = {}
+    result = []
+    for record in records:
+        ds = "ds:" + record.get("ds", "")
+        new_record = changed.get("key:" + record.key, record)
+        end = now if record.t1 == record.t2 else record.t2
+        totals[ds] = totals.get(ds, 0) + (end - record.t1)
+        if not stores.is_hidden(new_record):
+            result.append(new_record)
+            end = now if new_record.t1 == new_record.t2 else new_record.t2
+            totals[ds] -= end - new_record.t1
+    for total in totals.values():
+        if total != 0:
+            return False
+    return utils.find_overlaps(result, plan.t1, plan.t2, now, 1).total == 0
+
+
+def get_day_starts(t1, t2):
+    """Get the start times of the (local) days in the range t1-t2."""
+    day_starts = []
+    t = dt.floor(t1, "1D")
+    while t < t2:
+        day_starts.append(t)
+        t = dt.add(t, "1D")
+    return day_starts
+
+
+def _short_duration_str(t):
+    """Get a duration string, with seconds only if there are any."""
+    return dt.duration_string(t, t % 60 != 0)
+
+
 def _time_str(t, with_date=False):
     date, time = dt.time2localstr(t).split(" ")
     if with_date:
         return dt.format_isodate(date) + " " + time[:5]
     return time[:5]
+
+
+def _part_option_text(part, n, record, edited):
+    """Get the text of the option to choose a part of the records that are
+    only separated by breaks.
+    """
+    text = f"Part {part} of {n} · {_time_str(record.t1)}–"
+    if record.t1 == record.t2:
+        text += "running"
+    else:
+        duration = dt.duration_string(record.t2 - record.t1, False)
+        text += f"{_time_str(record.t2)} · {duration}"
+    if edited:
+        text += " · edited"
+    return text
+
+
+def _record_rows_html(records, with_date, show_notes):
+    """Get the html for the table rows of the given records (or dicts with
+    t1, t2, ds and note). Notes are shown in a row of their own, or else as
+    an icon after the description. An optional comment is shown after the
+    description.
+    """
+    html = ""
+    for record in records:
+        ds_html = _ds_to_html(record.get("ds", ""))
+        comment = record.get("comment", "")
+        note = record.get("note", "")
+        if note and not show_notes:
+            ds_html += " <i class='fas' style='color:#999;'>\uf249</i>"
+        if comment:
+            ds_html += f" <span style='color:#777;'>&nbsp;· {comment}</span>"
+        duration = dt.duration_string(record.t2 - record.t1, False)
+        html += f"""<tr><td>{duration}</td>
+            <td class='t1'>{_time_str(record.t1, with_date)}</td>
+            <td class='t2'>{_time_str(record.t2, with_date)}</td>
+            <td style='width:100%;'>{ds_html}</td></tr>"""
+        if note and show_notes:
+            note_html = utils.escape_html(note).replace("\n", "<br>")
+            html += f"<tr class='note_row'><td class='note' colspan='4'>{note_html}</td></tr>"
+    return html
 
 
 def _ds_to_html(ds):
@@ -1762,6 +1892,9 @@ class RecordDialog(BaseDialog):
         super().__init__(canvas)
         self._record = None
         self._no_user_edit_yet = True
+        self._time_edit = None
+        self._parts = []  # the records of the series that the record is part of
+        self._part_edits = {}  # "key:" + key -> the unsaved changes of a part
 
         # Enable stopping a record via the notification
         if window.navigator.serviceWorker:
@@ -1778,7 +1911,6 @@ class RecordDialog(BaseDialog):
         be called with the record. On close/cancel, the callback will
         be called without arguments.
         """
-        self._record = record.copy()
         assert mode.lower() in ("start", "new", "edit", "stop")
 
         html = f"""
@@ -1806,7 +1938,9 @@ class RecordDialog(BaseDialog):
             <div class='container'>
                 <textarea rows='3' spellcheck='true'></textarea>
             </div>
-            <h2><i class='fas'>\uf017</i>&nbsp;&nbsp;Time</h2>
+            <h2><i class='fas'>\uf017</i>&nbsp;&nbsp;Time
+                <select title='Choose which part to edit' style='display:none; margin-left:1em; font-size:0.8em; max-width:calc(100% - 1em);'></select>
+            </h2>
             <div></div>
             <div style='display:none; margin-top:1em;'></div>
             <div style='margin-top:2em;'></div>
@@ -1830,7 +1964,7 @@ class RecordDialog(BaseDialog):
             self._tag_hints_div,
             self._note_header,
             self._note_container,
-            _,  # Time header
+            self._time_header,
             self._time_node,
             self._multitask_div,
             _,  # Splitter
@@ -1846,6 +1980,7 @@ class RecordDialog(BaseDialog):
         self._preset_but = self._preset_container.children[1]
         self._preset_edit = self._preset_container.children[0]
         self._title_div = h1.children[1]
+        self._part_select = self._time_header.children[1]
         self._cancel_but1 = self.maindiv.children[0].children[-1]
         (
             self._cancel_but2,
@@ -1854,49 +1989,43 @@ class RecordDialog(BaseDialog):
             self._submit_but,
         ) = self._buttons.children
 
-        # Create the startstop-edit
-        self._time_edit = StartStopEdit(
-            self._time_node, self._on_times_change, record.t1, record.t2, mode
-        )
-
         # Prepare autocompletion
         self._autocompleter = Autocompleter(
             self._autocompleter_div, self._ds_input, self._autocomp_finished
         )
-
-        # Set some initial values
-        self._ds_input.value = record.get("ds", "")
-        self._note_input.value = record.get("note", "")
         self._note_input.setAttribute(
             "placeholder",
             "Longer context (optional). Tags only work in the description.",
         )
-        self._show_tags_from_ds()
-        self._delete_but2.style.display = "none"
-        self._no_user_edit_yet = True
 
-        # Offer to consolidate the multitasking session this record is part of
-        if mode.lower() == "edit" and record.t1 != record.t2:
-            blocks = get_consolidation_blocks(record.key)
-            if len(blocks) > 0:
-                plan = blocks[0].plan
-                self._multitask_div.innerHTML = f"""
-                    <i class='fas' style='color:#999;'>\uf5fd</i>&nbsp;
-                    Part of a multitasking session: {plan.n_before} records
-                    in {plan.n_threads} threads.
-                    <a style='cursor:pointer; text-decoration:underline;'>Consolidate</a>
-                    """
-                self._multitask_div.querySelector("a").onclick = self._consolidate
-                self._multitask_div.style.display = "block"
+        # Get the parts of the series of records that are only separated by
+        # breaks, so each part can be edited as a record of its own
+        self._parts = []
+        self._part_edits = {}
+        if mode.lower() == "edit":
+            series = get_break_series(record.key)
+            if series is not None and len(series.record_keys) > 1:
+                for key in series.record_keys:
+                    if key == record.key:
+                        self._parts.append(record.copy())
+                    else:
+                        part = window.store.records.get_by_key(key)
+                        if part is not None:
+                            self._parts.append(part)
+        for part in self._parts:
+            option = document.createElement("option")
+            option.value = part.key
+            self._part_select.appendChild(option)
 
-        # Show the right buttons
-        self._set_mode(mode)
+        # Show the record: its description, note, times and the right buttons
+        self._load_record(mode, record.copy(), False)
 
         # Connect things up
         self._cancel_but1.onclick = self.close
         self._cancel_but2.onclick = self.close
         self._submit_but.onclick = self.submit_soon
         self._resume_but.onclick = self.resume_record
+        self._part_select.onchange = self._on_part_select
         self._ds_input.oninput = self._on_user_edit
         self._ds_input.onblur = self._on_user_edit_done
         self._note_input.oninput = self._on_note_edit
@@ -1929,6 +2058,42 @@ class RecordDialog(BaseDialog):
         self._autogrow_note()
         if utils.looks_like_desktop():
             self._ds_input.focus()
+
+    def _load_record(self, mode, record, edited):
+        """Show the given record (a copy that the dialog can modify), with
+        edited indicating whether it has unsaved changes.
+        """
+        self._record = record
+
+        # Create the startstop-edit (it replaces the contents of its node)
+        if self._time_edit is not None:
+            self._time_edit.close()
+        self._time_edit = StartStopEdit(
+            self._time_node, self._on_times_change, record.t1, record.t2, mode
+        )
+
+        # Set the values
+        self._autocompleter.clear()
+        self._ds_input.value = record.get("ds", "")
+        self._note_input.value = record.get("note", "")
+        self._show_tags_from_ds()
+        self._delete_but2.style.display = "none"
+        self._no_user_edit_yet = not edited
+
+        # Show how this record relates to other records, with links to
+        # consolidate a multitasking session, or to merge records of a thread.
+        # The links close this dialog, so not if there are unsaved changes.
+        self._multitask_div.innerHTML = ""
+        self._multitask_div.style.display = "none"
+        if mode.lower() == "edit" and record.t1 != record.t2:
+            if not self._has_edits():
+                self._show_related_records(record)
+
+        # Show the right buttons
+        self._set_mode(mode)
+        if len(self._parts) > 1:
+            self._submit_but.disabled = not self._has_edits()
+        self._update_part_select()
 
     def _set_compose_state(self, value):
         self._is_composing = value
@@ -1966,8 +2131,10 @@ class RecordDialog(BaseDialog):
             self._submit_but.innerHTML = "<i class='fas'>\uf304</i>&nbsp;&nbsp;Save"
             title_mode = "Edit running" if is_running else "Edit"
             self._title_div.innerText = f"{title_mode} record"
-            self._submit_but.disabled = self._no_user_edit_yet
-            self._resume_but.style.display = "none" if is_running else "block"
+            self._submit_but.disabled = not self._has_edits()
+            # Resume does not save changes, so hide it if other parts have any
+            hide_resume = is_running or len(self._get_part_edits()) > 0
+            self._resume_but.style.display = "none" if hide_resume else "block"
             self._delete_but1.style.display = "block"
         elif lmode == "stop":
             self._submit_but.innerHTML = "<i class='fas'>\uf04d</i>&nbsp;&nbsp;Save"
@@ -1981,6 +2148,51 @@ class RecordDialog(BaseDialog):
             self._no_user_edit_yet = False
             self._submit_but.disabled = False
             self._multitask_div.style.display = "none"
+            self._update_part_select()
+
+    def _show_related_records(self, record):
+        lines = []
+        handlers = []
+        icon_style = "color:#999; display:inline-block; width:1.4em;"
+        link = "<a style='cursor:pointer; text-decoration:underline;'>"
+
+        blocks = get_consolidation_blocks(record.key)
+        if len(blocks) > 0:
+            plan = blocks[0].plan
+            lines.append(
+                f"<i class='fas' style='{icon_style}'>\uf5fd</i>"
+                + f"Part of a multitasking session: {plan.n_before} records "
+                + f"in {plan.n_threads} threads. {link}Consolidate</a>"
+            )
+            handlers.append(self._consolidate)
+
+        series = get_break_series(record.key)
+        if series is not None and len(series.record_keys) > 1:
+            n = len(series.record_keys)
+            total = dt.duration_string(series.total, False)
+            t1, t2 = _time_str(series.t1), _time_str(series.t2)
+            lines.append(
+                f"<i class='fas' style='{icon_style}'>\uf04c</i>"
+                + f"{n} parts separated by breaks: {total} "
+                + f"from {t1} to {t2}."
+            )
+
+        plan, _ = get_merge_plan(record.get("ds", ""), record.t1, [])
+        n = len(plan.candidate_keys)
+        if n > 1:
+            lines.append(
+                f"<i class='fas' style='{icon_style}'>\uf066</i>"
+                + f"{n} records of this thread on this day. "
+                + f"{link}Merge into the longest…</a>"
+            )
+            handlers.append(self._merge)
+
+        if len(lines) > 0:
+            self._multitask_div.innerHTML = "<br>".join(lines)
+            links = self._multitask_div.querySelectorAll("a")
+            for i in range(len(links)):
+                links[i].onclick = handlers[i]
+            self._multitask_div.style.display = "block"
 
     def _consolidate(self):
         # Close this dialog first, so it cannot overwrite the consolidated record
@@ -1989,6 +2201,100 @@ class RecordDialog(BaseDialog):
         key = self._record.key
         self.close()
         self._canvas.consolidate_dialog.open(key, False, callback)
+
+    def _merge(self):
+        # Close this dialog first, so it cannot overwrite the merged records
+        callback = self._callback
+        self._callback = None
+        key = self._record.key
+        self.close()
+        self._canvas.merge_dialog.open(key, callback)
+
+    def _read_form(self):
+        """Set the description and note from the form in the record."""
+        _, parts = utils.get_tags_and_parts_from_string(to_str(self._ds_input.value))
+        self._record.ds = parts.join("")
+        if not self._record.ds:
+            self._record.pop("ds", None)
+        # The note is the prose; kept separate from the ds "header"
+        note = to_text(self._note_input.value).strip()
+        if note:
+            self._record.note = note
+        else:
+            self._record.pop("note", None)
+
+    def _part_differs(self, record):
+        """Get whether the record differs from the record in the store."""
+        stored = window.store.records.get_by_key(record.key)
+        if stored is None:
+            return True
+        return (
+            record.get("ds", "") != stored.get("ds", "")
+            or record.get("note", "") != stored.get("note", "")
+            or record.t1 != stored.t1
+            or record.t2 != stored.t2
+        )
+
+    def _keep_part_edit(self):
+        """Keep the changes of the shown part, to save them with the others."""
+        if self._no_user_edit_yet:
+            return
+        self._read_form()
+        key = "key:" + self._record.key
+        if self._part_differs(self._record):
+            mode = "Stop" if self._lmode == "stop" else "Edit"
+            self._part_edits[key] = {"record": self._record, "mode": mode}
+        else:
+            self._part_edits.pop(key, None)
+
+    def _get_part_edits(self):
+        """Get the kept changes of the parts other than the shown part."""
+        edits = []
+        for key, edit in self._part_edits.items():
+            if key != "key:" + self._record.key:
+                edits.append(edit)
+        return edits
+
+    def _has_edits(self):
+        """Get whether the shown record or any other part has changes."""
+        return not self._no_user_edit_yet or len(self._get_part_edits()) > 0
+
+    def _on_part_select(self):
+        """Show the chosen part, keeping the changes of the shown part."""
+        key = self._part_select.value
+        if key == self._record.key:
+            return
+        self._keep_part_edit()
+        edit = self._part_edits.get("key:" + key, None)
+        if edit is not None:
+            self._load_record(edit.mode, edit.record, True)
+        else:
+            for part in self._parts:
+                if part.key == key:
+                    record = window.store.records.get_by_key(key) or part.copy()
+                    self._load_record("Edit", record, False)
+        self._autogrow_note()
+
+    def _update_part_select(self):
+        """Show the parts to choose from, with their current times."""
+        n = len(self._parts)
+        if n < 2:
+            self._part_select.style.display = "none"
+            return
+        options = self._part_select.options
+        for i in range(n):
+            key = self._parts[i].key
+            edit = self._part_edits.get("key:" + key, None)
+            if key == self._record.key:
+                record, edited = self._record, not self._no_user_edit_yet
+            elif edit is not None:
+                record, edited = edit.record, True
+            else:
+                record = window.store.records.get_by_key(key) or self._parts[i]
+                edited = False
+            options[i].text = _part_option_text(i + 1, n, record, edited)
+        self._part_select.value = self._record.key
+        self._part_select.style.display = "inline-block"
 
     def _on_user_edit(self):
         self._mark_as_edited()
@@ -2076,6 +2382,7 @@ class RecordDialog(BaseDialog):
                 self._set_mode("Start")
             else:
                 self._set_mode("Edit")
+        self._update_part_select()
 
     def _show_tags_from_ds(self):
         """Get all current tags. If different, update suggestions."""
@@ -2144,10 +2451,13 @@ class RecordDialog(BaseDialog):
         self._delete_but2.style.display = "block"
 
     def _delete2(self):
+        # Save the changes of the other parts along with it
+        items = [edit.record for edit in self._get_part_edits()]
         record = self._record
         window.stores.make_hidden(record)  # Sets the description
         record.t2 = record.t1 + 1  # Set duration to 1s (t1 == t2 means running)
-        window.store.records.put(record)
+        items.append(record)
+        window.store.records.put(*items)
         self.close(record)
 
     def _stop_all_running_records(self, t2=None):
@@ -2163,22 +2473,24 @@ class RecordDialog(BaseDialog):
         # Submit means close if there was nothing to submit
         if self._submit_but.disabled:
             return self.close()
-        # Set record.ds
-        _, parts = utils.get_tags_and_parts_from_string(to_str(self._ds_input.value))
-        self._record.ds = parts.join("")
-        if not self._record.ds:
-            self._record.pop("ds", None)
-        # Set record.note (the prose; kept separate from the ds "header")
-        note = to_text(self._note_input.value).strip()
-        if note:
-            self._record.note = note
-        else:
-            self._record.pop("note", None)
-        # Prevent multiple timers at once
-        if self._record.t1 == self._record.t2:
-            self._stop_all_running_records(self._record.t1)
+        # Save the changes of the other parts of the series too
+        items = []
+        stopped = self._lmode == "stop"
+        for edit in self._get_part_edits():
+            items.append(edit.record)
+            if edit.mode == "Stop":
+                stopped = True
+        # Set record.ds and record.note
+        self._read_form()
+        # When editing, only save the shown record if it has changed
+        if self._lmode != "edit" or self._part_differs(self._record):
+            # Prevent multiple timers at once
+            if self._record.t1 == self._record.t2:
+                self._stop_all_running_records(self._record.t1)
+            items.append(self._record)
         # Apply
-        window.store.records.put(self._record)
+        if len(items) > 0:
+            window.store.records.put(*items)
         super().submit(self._record)
         # Notify
         if self._lmode == "start":
@@ -2187,7 +2499,7 @@ class RecordDialog(BaseDialog):
         if window.simplesettings.get("pomodoro_enabled"):
             if self._lmode == "start":
                 self._canvas.pomodoro_dialog.start_work()
-            elif self._lmode == "stop":
+            elif stopped:
                 self._canvas.pomodoro_dialog.stop()
 
     def resume_record(self):
@@ -2522,26 +2834,8 @@ class ConsolidateDialog(BaseDialog):
         for warning in warnings:
             warnings_html += f"<div style='color:#955;'><i class='fas'>\uf071</i>&nbsp; {warning}</div>"
 
-        rows_before = ""
-        for record in records:
-            ds_html = _ds_to_html(record.get("ds", ""))
-            if record.get("note", ""):
-                ds_html += " <i class='fas' style='color:#999;'>\uf249</i>"
-            duration = dt.duration_string(record.t2 - record.t1, False)
-            rows_before += f"""<tr><td>{duration}</td>
-                <td class='t1'>{_time_str(record.t1, with_date)}</td>
-                <td class='t2'>{_time_str(record.t2, with_date)}</td>
-                <td style='width:100%;'>{ds_html}</td></tr>"""
-        rows_after = ""
-        for merged in plan.blocks:
-            duration = dt.duration_string(merged.t2 - merged.t1, False)
-            rows_after += f"""<tr><td>{duration}</td>
-                <td class='t1'>{_time_str(merged.t1, with_date)}</td>
-                <td class='t2'>{_time_str(merged.t2, with_date)}</td>
-                <td style='width:100%;'>{_ds_to_html(merged.ds)}</td></tr>"""
-            if merged.note:
-                note_html = utils.escape_html(merged.note).replace("\n", "<br>")
-                rows_after += f"<tr class='note_row'><td class='note' colspan='4'>{note_html}</td></tr>"
+        rows_before = _record_rows_html(records, with_date, False)
+        rows_after = _record_rows_html(plan.blocks, with_date, True)
 
         label_style = "margin-top:0.8em; font-size:90%; color:#777;"
         return f"""
@@ -2670,6 +2964,322 @@ class ConsolidateDialog(BaseDialog):
         self._snapshot = []
         self._applied = False
         self._blocks = get_consolidation_blocks(self._key, self._auto)
+        self._render("Restored the original records.")
+
+
+class MergeDialog(BaseDialog):
+    """Dialog to merge records of a thread into the longest record of that
+    thread on the same day, as if that record lasted without a break.
+    """
+
+    def __init__(self, canvas):
+        super().__init__(canvas)
+        self._ds = ""
+        self._t = 0
+        self._selected = []
+        self._plan = None
+        self._records = []
+        self._snapshot = []
+        self._merged_keys = []
+        self._applied = False
+
+    def open(self, key, callback=None):
+        """Open the dialog for the thread and the day of the record with the
+        given key. That record is selected, or if it is the longest record,
+        all the other records are.
+        """
+        record = window.store.records.get_by_key(key)
+        if record is None:
+            return
+        self._ds = record.get("ds", "")
+        self._t = record.t1
+        self._snapshot = []
+        self._applied = False
+        plan, _ = get_merge_plan(self._ds, self._t, [])
+        if key == plan.anchor_key:
+            self._selected = [k for k in plan.candidate_keys if k != key]
+        else:
+            self._selected = [key]
+        self._update_plan()
+        self._render("")
+        super().open(callback)
+
+    def _update_plan(self):
+        self._plan, self._records = get_merge_plan(self._ds, self._t, self._selected)
+
+    def _render(self, message):
+        date = dt.format_isodate(dt.time2localstr(self._t).split(" ")[0])
+        label_style = "margin-top:0.8em; font-size:90%; color:#777;"
+        html = f"""
+            <h1><i class='fas'>\uf066</i>&nbsp;&nbsp;Merge records
+                <button type='button'><i class='fas'>\uf00d</i></button>
+            </h1>
+            <p></p>
+            <div style='{label_style}'>Records of this thread on {date}</div>
+            <div><table></table></div>
+            <div></div>
+            <div style='margin-top:1em;'></div>
+            <div style='display: flex;justify-content: flex-end;'>
+                <button type='button' class='actionbutton'></button>
+                <button type='button' class='actionbutton'><i class='fas'>\uf0e2</i>&nbsp;&nbsp;Undo</button>
+                <button type='button' class='actionbutton submit'><i class='fas'>\uf066</i>&nbsp;&nbsp;Merge</button>
+            </div>
+        """
+        self.maindiv.innerHTML = html
+        (
+            h1,
+            self._message_p,
+            _,  # label
+            candidates_div,
+            self._preview_div,
+            _,  # splitter
+            buttons,
+        ) = self.maindiv.children
+        self._candidates_table = candidates_div.children[0]
+        self._cancel_but, self._undo_but, self._submit_but = buttons.children
+        h1.children[-1].onclick = self.close
+        self._cancel_but.onclick = self.close
+        self._undo_but.onclick = self._undo
+        self._submit_but.onclick = self._apply
+
+        if message:
+            self._message_p.innerHTML = message
+        else:
+            self._message_p.innerHTML = (
+                "The selected records are added to the longest record, as if "
+                + "it lasted without a break. Records in between move to make "
+                + "room. The time per thread stays the same, but the start and "
+                + "end times no longer reflect when the work was actually done."
+            )
+        self._render_candidates()
+        self._render_preview()
+        self._update_buttons()
+
+    def _get_records_by_key(self):
+        records_by_key = {}
+        for record in self._records:
+            records_by_key["key:" + record.key] = record
+        return records_by_key
+
+    def _render_candidates(self):
+        plan = self._plan
+        records_by_key = self._get_records_by_key()
+        now = int(dt.now())
+        rows = ""
+        for key in plan.candidate_keys:
+            record = records_by_key["key:" + key]
+            t2 = now if record.t1 == record.t2 else record.t2
+            ds_html = _ds_to_html(record.get("ds", ""))
+            if record.get("note", ""):
+                ds_html += " <i class='fas' style='color:#999;'>\uf249</i>"
+            if key == plan.anchor_key:
+                check = ""
+                ds_html += " <span style='color:#777;'>&nbsp;· longest</span>"
+            else:
+                state = " checked" if key in self._selected else ""
+                if self._applied:
+                    state += " disabled"
+                check = f"<input type='checkbox' data-key='{key}'{state}>"
+            duration = dt.duration_string(t2 - record.t1, False)
+            rows += f"""<tr><td>{check}</td><td>{duration}</td>
+                <td class='t1'>{_time_str(record.t1)}</td>
+                <td class='t2'>{_time_str(t2)}</td>
+                <td style='width:100%;'>{ds_html}</td></tr>"""
+        self._candidates_table.innerHTML = rows
+        checkboxes = self._get_checkboxes()
+        for i in range(len(checkboxes)):
+            checkboxes[i].onchange = self._on_selection_change
+
+    def _render_preview(self):
+        plan = self._plan
+        if self._applied:
+            self._preview_div.innerHTML = ""
+            return
+
+        # Explain why the records cannot be merged
+        reasons = {
+            "not_found": "There are no records of this thread on this day.",
+            "midnight": "A selected record continues after midnight. Records "
+            + "cannot move into the next day.",
+            "running": "A record in this range is still running. Stop the timer first.",
+            "overlap": "Some records in this range overlap. Please fix these "
+            + "overlaps first.",
+        }
+        warning_style = "margin-top:1em; color:#955;"
+        warning_icon = "<i class='fas'>\uf071</i>&nbsp; "
+        if plan.reason == "nothing_selected":
+            if len(plan.candidate_keys) < 2:
+                text = "This is the only record of this thread on this day."
+            else:
+                text = "Select the records to add to the longest record."
+            self._preview_div.innerHTML = f"<div style='margin-top:1em;'>{text}</div>"
+            return
+        elif plan.reason:
+            text = reasons.get(plan.reason, plan.reason)
+            html = f"<div style='{warning_style}'>{warning_icon}{text}</div>"
+            self._preview_div.innerHTML = html
+            return
+
+        # Show what would change
+        warnings = []
+        if len(plan.shifted) == 1:
+            shift = _short_duration_str(plan.max_shift)
+            warnings.append(f"1 other record moves by {shift}.")
+        elif len(plan.shifted) > 1:
+            shift = _short_duration_str(plan.max_shift)
+            n = len(plan.shifted)
+            warnings.append(f"{n} other records move by up to {shift}.")
+        if plan.notes_truncated:
+            warnings.append("The merged notes are too long and will be truncated.")
+        html = ""
+        for warning in warnings:
+            html += f"<div style='{warning_style}'>{warning_icon}{warning}</div>"
+
+        changes = {}
+        changes["key:" + plan.anchor.key] = plan.anchor
+        for s in plan.shifted:
+            changes["key:" + s.key] = s
+        hidden = {}
+        for key in plan.hide:
+            hidden["key:" + key] = True
+        items = []
+        for record in self._records:
+            if hidden.get("key:" + record.key, False):
+                continue
+            change = changes.get("key:" + record.key, None)
+            if change is None:
+                if record.t2 <= plan.t1 or record.t1 >= plan.t2:
+                    continue  # outside of the range that changes
+                item = record.copy()
+                item.pop("note", None)
+            elif record.key == plan.anchor.key:
+                item = record.copy()
+                item.t1 = change.t1
+                item.t2 = change.t2
+                item.note = change.note
+                added = _short_duration_str(plan.added)
+                item.comment = f"{added} added"
+            else:
+                item = record.copy()
+                item.pop("note", None)
+                item.t1 = change.t1
+                item.t2 = change.t2
+                shift = _short_duration_str(abs(change.delta))
+                later = "later" if change.delta > 0 else "earlier"
+                item.comment = f"moved {shift} {later}"
+            items.append(item)
+        items.sort(key=lambda r: r.t1)
+        label_style = "margin-top:0.8em; font-size:90%; color:#777;"
+        html += f"<div style='{label_style}'>After</div>"
+        html += f"<table>{_record_rows_html(items, False, True)}</table>"
+        self._preview_div.innerHTML = html
+
+    def _get_checkboxes(self):
+        # Note: a NodeList is not an array, so iterate over it using an index
+        return self._candidates_table.querySelectorAll("input[type=checkbox]")
+
+    def _on_selection_change(self):
+        if self._applied:
+            return
+        selected = []
+        checkboxes = self._get_checkboxes()
+        for i in range(len(checkboxes)):
+            if checkboxes[i].checked:
+                selected.append(checkboxes[i].getAttribute("data-key"))
+        self._selected = selected
+        self._update_plan()
+        self._render_candidates()
+        self._render_preview()
+        self._update_buttons()
+
+    def _update_buttons(self):
+        close_icon = "<i class='fas'>\uf00d</i>&nbsp;&nbsp;"
+        if self._applied or len(self._plan.candidate_keys) < 2:
+            self._cancel_but.innerHTML = close_icon + "Close"
+            self._submit_but.style.display = "none"
+        else:
+            self._cancel_but.innerHTML = close_icon + "Keep as is"
+            self._submit_but.style.display = "block"
+            can_merge = not self._plan.reason and not window.store.is_read_only
+            self._submit_but.disabled = not can_merge
+        self._undo_but.style.display = "block" if self._applied else "none"
+
+    def _on_key(self, e):
+        key = e.key.lower()
+        if key == "enter" or key == "return":
+            e.preventDefault()
+            if self._applied or self._submit_but.disabled:
+                self.close()
+            else:
+                self._apply()
+        else:
+            super()._on_key(e)
+
+    def _apply(self):
+        if window.store.is_read_only or self._applied:
+            return
+        if self._plan.reason:
+            return
+
+        # Plan again, to make sure that the records did not change meanwhile
+        signature = _merge_signature(self._plan)
+        self._update_plan()
+        plan = self._plan
+        if plan.reason or _merge_signature(plan) != signature:
+            self._render("The records have changed. Please review again.")
+            return
+
+        records_by_key = self._get_records_by_key()
+        items = []
+        snapshot = []
+        record = records_by_key["key:" + plan.anchor.key].copy()
+        snapshot.append(record.copy())
+        record.t1 = plan.anchor.t1
+        record.t2 = plan.anchor.t2
+        if plan.anchor.note:
+            record.note = plan.anchor.note
+        else:
+            record.pop("note", None)
+        items.append(record)
+        for s in plan.shifted:
+            record = records_by_key["key:" + s.key].copy()
+            snapshot.append(record.copy())
+            record.t1 = s.t1
+            record.t2 = s.t2
+            items.append(record)
+        for key in plan.hide:
+            record = records_by_key["key:" + key].copy()
+            snapshot.append(record.copy())
+            stores.make_hidden(record)
+            record.t2 = record.t1 + 1  # t1 == t2 means running
+            items.append(record)
+
+        now = int(dt.now())
+        if not _merge_result_is_valid(self._records, items, plan, now):
+            console.warn("Refusing to merge records with an inconsistent plan")
+            return
+
+        window.store.records.put(*items)
+        self._snapshot = snapshot
+        self._merged_keys = plan.hide
+        self._applied = True
+        self._selected = []
+        self._update_plan()
+        n = len(plan.hide)
+        what = "1 record" if n == 1 else f"{n} records"
+        self._render(
+            f"Merged {what} into the longest record. "
+            + "Use Undo to restore the original records."
+        )
+
+    def _undo(self):
+        if window.store.is_read_only or not self._applied:
+            return
+        window.store.records.put(*[record.copy() for record in self._snapshot])
+        self._snapshot = []
+        self._applied = False
+        self._selected = self._merged_keys
+        self._update_plan()
         self._render("Restored the original records.")
 
 
@@ -3582,6 +4192,7 @@ class ReportDialog(BaseDialog):
                     <label style='margin-left:1.5em;'>
                         <input type='checkbox' checked /> Show notes</label>
                 </div>
+                <div>Breaks:</div> <label><input type='checkbox' checked /> Join records across breaks</label>
                 <button type='button'><i class='fas'>\uf328</i>&nbsp;&nbsp;{self._copybuttext}</button>
                     <div>paste in a spreadsheet</div>
                 <button type='button'><i class='fas'>\uf0ce</i>&nbsp;&nbsp;Save CSV</button>
@@ -3608,9 +4219,10 @@ class ReportDialog(BaseDialog):
         # Both checkboxes live in one grid cell, so the indices below do not shift
         self._showrecords_but = form.children[13].children[0].children[0]
         self._shownotes_but = form.children[13].children[1].children[0]
-        self._copy_but = form.children[14]
-        self._savecsv_but = form.children[16]
-        self._savepdf_but = form.children[18]
+        self._joinbreaks_but = form.children[15].children[0]  # inside label
+        self._copy_but = form.children[16]
+        self._savecsv_but = form.children[18]
+        self._savepdf_but = form.children[20]
 
         # Connect input elements
         close_but = self.maindiv.children[0].children[-1]
@@ -3638,6 +4250,8 @@ class ReportDialog(BaseDialog):
         self._showrecords_but.checked = showrecords
         shownotes = window.simplesettings.get("report_shownotes")
         self._shownotes_but.checked = shownotes
+        joinbreaks = window.simplesettings.get("report_joinbreaks")
+        self._joinbreaks_but.checked = joinbreaks
         #
         self._grouping_select.onchange = self._on_setting_changed
         self._groupperiod_select.onchange = self._on_setting_changed
@@ -3645,6 +4259,7 @@ class ReportDialog(BaseDialog):
         self._format_but.onchange = self._on_setting_changed
         self._showrecords_but.oninput = self._on_setting_changed
         self._shownotes_but.oninput = self._on_setting_changed
+        self._joinbreaks_but.oninput = self._on_setting_changed
         #
         self._copy_but.onclick = self._copy_clipboard
         self._savecsv_but.onclick = self._save_as_csv
@@ -3666,6 +4281,7 @@ class ReportDialog(BaseDialog):
         window.simplesettings.set("report_format", self._format_but.value)
         window.simplesettings.set("report_showrecords", self._showrecords_but.checked)
         window.simplesettings.set("report_shownotes", self._shownotes_but.checked)
+        window.simplesettings.set("report_joinbreaks", self._joinbreaks_but.checked)
         self._update_table()
 
     def _update_table(self):
@@ -3733,6 +4349,11 @@ class ReportDialog(BaseDialog):
         for i in range(len(records)):
             record = records[i]
             record.duration = round_duration(min(t2, record.t2) - max(t1, record.t1))
+
+        # Show records that are only separated by breaks as one record. This
+        # considers all records, so it does not depend on the selected tags.
+        if self._joinbreaks_but.checked:
+            records = self._join_records_across_breaks(records, t1, t2, round_duration)
 
         # Determine priorities
         priorities = {}
@@ -3909,10 +4530,45 @@ class ReportDialog(BaseDialog):
                             to_str(record.get("ds", "")),  # strip tabs and newlines
                             window.store.records.tags_from_record(record).join(" "),
                             record.get("note", ""),  # prose, may contain newlines
+                            record.get("n_parts", 1),  # joined across breaks
+                            record.get("breaks", 0),
                         ]
                     )
 
         return rows
+
+    def _join_records_across_breaks(self, records, t1, t2, round_duration):
+        """Replace each series of records that are only separated by breaks
+        with one record, that starts at the first and ends at the last. Its
+        duration is the rounded sum of the durations (without the breaks).
+        """
+        now = int(dt.now())
+        records_by_key = {}
+        for i in range(len(records)):
+            records_by_key["key:" + records[i].key] = records[i]
+
+        items = []
+        for series in utils.find_break_series(records, get_day_starts(t1, t2), now):
+            keys = series.record_keys
+            if len(keys) == 1:
+                items.append(records_by_key["key:" + keys[0]])
+                continue
+            item = records_by_key["key:" + series.key].copy()
+            item.t1 = records_by_key["key:" + keys[0]].t1
+            duration = 0
+            for key in keys:
+                record = records_by_key["key:" + key]
+                duration += max(0, min(t2, record.t2) - max(t1, record.t1))
+                item.t2 = max(item.t2, record.t2)
+            item.duration = round_duration(duration)
+            if series.note:
+                item.note = series.note
+            else:
+                item.pop("note", None)
+            item.n_parts = len(keys)
+            item.breaks = series.breaks
+            items.append(item)
+        return items
 
     def _generate_table_html(self, rows):
         window._open_record_dialog = self._open_record
@@ -3929,9 +4585,14 @@ class ReportDialog(BaseDialog):
                 )
             elif row[0] == "record":
                 _, key, duration, sd1, st1, st2, ds, tagz = row
+                t2_attrs = "class='t2'"
+                if row[9] > 1:
+                    breaks = dt.duration_string(row[10], False)
+                    title = f"{row[9]} parts, {breaks} of breaks"
+                    t2_attrs = f"class='t2 breaks' title='{title}'"
                 lines.append(
                     f"<tr><td></td><td></td><td>{duration}</td>"
-                    + f"<td>{sd1}</td><td class='t1'>{st1}</td><td class='t2'>{st2}</td>"
+                    + f"<td>{sd1}</td><td class='t1'>{st1}</td><td {t2_attrs}>{st2}</td>"
                     + f"<td><a onclick='window._open_record_dialog(\"{key}\")' style='cursor:pointer;'>"
                     + f"{ds or '&nbsp;-&nbsp;'}</a></td></tr>"
                 )
@@ -4851,6 +5512,9 @@ class SettingsDialog(BaseDialog):
             <label style='display:block; margin-top:0.5em;'>
                 <input type='checkbox' checked='true'></input>
                 Offer to consolidate multitasking sessions when stopping the timer</label>
+            <label style='display:block; margin-top:0.5em;'>
+                <input type='checkbox' checked='true'></input>
+                Show records that are separated by breaks with one label in the timeline</label>
 
             <hr style='margin-top: 1em;' />
 
@@ -4901,6 +5565,7 @@ class SettingsDialog(BaseDialog):
             _,  # Misc header
             self._stopwatch_label,
             self._consolidate_label,
+            self._joinbreaks_label,
             _,  # hr
             _,  # Section: per device
             _,  # Appearance header
@@ -4972,6 +5637,12 @@ class SettingsDialog(BaseDialog):
         self._consolidate_check = self._consolidate_label.children[0]
         self._consolidate_check.checked = offer_consolidation
         self._consolidate_check.onchange = self._on_consolidate_check
+
+        # Show records that are separated by breaks with one label
+        join_breaks = window.simplesettings.get("timeline_joinbreaks")
+        self._joinbreaks_check = self._joinbreaks_label.children[0]
+        self._joinbreaks_check.checked = join_breaks
+        self._joinbreaks_check.onchange = self._on_joinbreaks_check
 
         # Device settings
 
@@ -5066,6 +5737,10 @@ class SettingsDialog(BaseDialog):
     def _on_consolidate_check(self):
         offer_consolidation = bool(self._consolidate_check.checked)
         window.simplesettings.set("multitask_offer_consolidation", offer_consolidation)
+
+    def _on_joinbreaks_check(self):
+        join_breaks = bool(self._joinbreaks_check.checked)
+        window.simplesettings.set("timeline_joinbreaks", join_breaks)
 
 
 class GuideDialog(BaseDialog):

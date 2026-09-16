@@ -447,7 +447,7 @@ def timestr2tuple(text):
     return h, m, s
 
 
-# %% Multitasking: sessions of adjacent records, consolidation, overlaps
+# %% Multitasking: sessions of adjacent records, consolidation, overlaps, breaks
 #
 # These functions work on plain lists of record dicts, so they can be tested
 # in Python. Records are accessed via subscripts, and dicts that are used as
@@ -616,15 +616,13 @@ def plan_consolidation(records, note_max):
         if ("ds:" + ds) not in group_indices:
             group_indices["ds:" + ds] = len(groups)
             groups.append(
-                {"ds": ds, "total": 0, "mass": 0, "record_keys": [], "notes": []}
+                {"ds": ds, "total": 0, "mass": 0, "record_keys": [], "records": []}
             )
         group = groups[group_indices["ds:" + ds]]
         group["total"] += owned[i]
         group["mass"] += mass[i]
         group["record_keys"].append(record["key"])
-        note = (record.get("note", "") or "").strip()
-        if len(note) > 0 and note not in group["notes"]:
-            group["notes"].append(note)
+        group["records"].append(record)
 
     # Order the threads that have time left by their center of mass (the sort
     # is stable, so on a tie the thread that appeared first comes first).
@@ -642,7 +640,7 @@ def plan_consolidation(records, note_max):
     t = base
     kept_keys = {}
     for group in live_groups:
-        note = "\n".join(group["notes"])
+        note = merge_notes(group["records"])
         if len(note) > note_max:
             note = note[:note_max].strip()
             plan["notes_truncated"] = True
@@ -793,6 +791,270 @@ def find_overlaps(records, t1, t2, now, min_overlap):
         union += max(0, item["t2"] - max(item["t1"], union_end))
         union_end = max(union_end, item["t2"])
     return {"total": raw - union, "pairs": pairs}
+
+
+def merge_notes(records):
+    """Merge the notes of the given records (sorted by start time) into one
+    note. Empty notes and duplicates are skipped, and so is a note that
+    another note extends (e.g. a note that was copied when resuming a thread,
+    and then added to).
+    """
+    notes = []
+    for record in records:
+        note = (record.get("note", "") or "").strip()
+        if len(note) > 0:
+            notes.append(note)
+    merged = []
+    for i in range(len(notes)):
+        keep = True
+        for j in range(len(notes)):
+            if j < i and notes[j] == notes[i]:
+                keep = False  # a duplicate
+            elif notes[j] != notes[i] and notes[j].startswith(notes[i] + "\n"):
+                keep = False  # extended by another note
+        if keep:
+            merged.append(notes[i])
+    return "\n".join(merged)
+
+
+def find_break_series(records, day_starts, now):
+    """Find the series of records that are only separated by breaks: records
+    with the same description on the same day, where no other record covers
+    any part of the gaps in between. Running records end now.
+
+    The day_starts are the sorted start times of the days (local midnights).
+    Records that start before the first day are on a day of their own.
+    Returns a list of series sorted by start time. Each series is a dict with
+    ds, record_keys (sorted by start time), key (of the running record, or
+    else of the record that ends last), t1, t2 (the latest end), running,
+    total (the sum of the durations), breaks (the time between the records),
+    and note (the merged notes). A record on its own is a series too.
+    """
+    series_list = []
+    series_records = []  # the records of each series
+    series_days = []  # the day index of each series
+    last_index = {}  # "ds:" + ds -> index of the latest series of that thread
+    day_index = -1
+    seen_end = None  # the latest end of the records so far
+    before_end = None  # the latest end of the records that start earlier
+    group_t1 = None
+    for record in _sorted_records(records, now):
+        t1 = record["t1"]
+        end = _record_end(record, now)
+        ds = _record_ds(record)
+        while day_index + 1 < len(day_starts) and day_starts[day_index + 1] <= t1:
+            day_index += 1
+        # Records that start at the same time do not cover each other's gap
+        if group_t1 is None or t1 != group_t1:
+            before_end = seen_end
+            group_t1 = t1
+
+        # Join the latest series of this thread, if there is only a break
+        index = last_index.get("ds:" + ds, None)
+        if index is not None:
+            t2 = series_list[index]["t2"]
+            if series_days[index] != day_index:
+                index = None
+            elif t1 > t2 and before_end is not None and before_end > t2:
+                index = None  # another record covers (a part of) the gap
+        if index is None:
+            index = len(series_list)
+            last_index["ds:" + ds] = index
+            series_list.append(
+                {
+                    "ds": ds,
+                    "record_keys": [],
+                    "key": record["key"],
+                    "t1": t1,
+                    "t2": end,
+                    "running": False,
+                    "total": 0,
+                    "breaks": 0,
+                    "note": "",
+                }
+            )
+            series_records.append([])
+            series_days.append(day_index)
+
+        series = series_list[index]
+        if t1 > series["t2"]:
+            series["breaks"] += t1 - series["t2"]
+        if record["t1"] == record["t2"]:
+            series["running"] = True
+            series["key"] = record["key"]
+        elif not series["running"] and end >= series["t2"]:
+            series["key"] = record["key"]
+        series["t2"] = max(series["t2"], end)
+        series["total"] += end - t1
+        series["record_keys"].append(record["key"])
+        series_records[index].append(record)
+        if seen_end is None:
+            seen_end = end
+        else:
+            seen_end = max(seen_end, end)
+
+    for i in range(len(series_list)):
+        series_list[i]["note"] = merge_notes(series_records[i])
+    return series_list
+
+
+def plan_record_merge(records, ds, merge_keys, day_t1, day_t2, now, note_max):
+    """Plan merging records of a thread into the longest record of that thread
+    on the day day_t1-day_t2, as if that record lasted without a break.
+
+    The candidates are the records with the given description that start on
+    that day, and the longest candidate is the anchor (on a tie the earliest).
+    Of the selected candidates (merge_keys), the durations of the records that
+    start after the anchor are added to its end, and the durations of those
+    that start before it to its start. The records that are in the way move
+    later (or earlier), but only until a break absorbs the shift, and the
+    selected records are to be hidden. So no records overlap afterwards, and
+    each thread keeps its total time. The given records must include all the
+    records of that day.
+
+    Returns a dict with the reason why the plan cannot be applied ("" if it
+    can, "not_found", "nothing_selected", "midnight", "running" or "overlap"),
+    candidate_keys, anchor_key, anchor (a dict with key, t1, t2 and note, or
+    None), shifted (dicts with key, t1, t2 and delta), hide, added (the time
+    added to the anchor), t1 and t2 (the range that changes), max_shift, and
+    notes_truncated.
+    """
+    items = _sorted_records(records, now)
+    plan = {
+        "reason": "",
+        "candidate_keys": [],
+        "anchor_key": "",
+        "anchor": None,
+        "shifted": [],
+        "hide": [],
+        "added": 0,
+        "t1": 0,
+        "t2": 0,
+        "max_shift": 0,
+        "notes_truncated": False,
+    }
+
+    # Find the candidates and the anchor
+    anchor = None
+    candidates = {}
+    for record in items:
+        if _record_ds(record) != ds:
+            continue
+        if record["t1"] < day_t1 or record["t1"] >= day_t2:
+            continue
+        candidates["key:" + record["key"]] = True
+        plan["candidate_keys"].append(record["key"])
+        duration = _record_end(record, now) - record["t1"]
+        if anchor is None or duration > _record_end(anchor, now) - anchor["t1"]:
+            anchor = record
+    if anchor is None:
+        plan["reason"] = "not_found"
+        return plan
+    plan["anchor_key"] = anchor["key"]
+
+    # Collect the selected records, and the range that they span with the anchor
+    selected = {}
+    for key in merge_keys:
+        if key != anchor["key"] and candidates.get("key:" + key, False):
+            selected["key:" + key] = True
+    before_total = 0
+    after_total = 0
+    t1 = anchor["t1"]
+    t2 = _record_end(anchor, now)
+    note_records = []
+    others = []
+    for record in items:
+        if record["key"] == anchor["key"]:
+            note_records.append(record)
+            continue
+        if not selected.get("key:" + record["key"], False):
+            others.append(record)
+            continue
+        end = _record_end(record, now)
+        note_records.append(record)
+        plan["hide"].append(record["key"])
+        if record["t1"] < anchor["t1"]:
+            before_total += end - record["t1"]
+        else:
+            after_total += end - record["t1"]
+        t1 = min(t1, record["t1"])
+        t2 = max(t2, end)
+        if end > day_t2:
+            plan["reason"] = "midnight"
+    plan["added"] = before_total + after_total
+    plan["t1"] = t1
+    plan["t2"] = t2
+    if len(plan["hide"]) == 0:
+        plan["reason"] = "nothing_selected"
+    if plan["reason"]:
+        return plan
+
+    # The records in the range must not be running or overlap, because then
+    # moving them could make records overlap.
+    for record in items:
+        if record["t1"] == record["t2"]:
+            if record["t1"] < t2 and _record_end(record, now) > t1:
+                plan["reason"] = "running"
+                return plan
+    if find_overlaps(items, t1, t2, now, 1)["total"] > 0:
+        plan["reason"] = "overlap"
+        return plan
+
+    # Extend the anchor
+    note = merge_notes(note_records)
+    if len(note) > note_max:
+        note = note[:note_max].strip()
+        plan["notes_truncated"] = True
+    anchor_t1 = anchor["t1"] - before_total
+    anchor_t2 = anchor["t2"] + after_total
+    plan["anchor"] = {"key": anchor["key"], "t1": anchor_t1, "t2": anchor_t2}
+    plan["anchor"]["note"] = note
+
+    # Move the records after the anchor later, until one fits
+    shifted = []
+    cursor = anchor_t2
+    for record in others:
+        if record["t1"] < anchor["t2"]:
+            continue
+        if record["t1"] >= cursor:
+            break
+        delta = cursor - record["t1"]
+        shifted.append(
+            {
+                "key": record["key"],
+                "t1": cursor,
+                "t2": record["t2"] + delta,
+                "delta": delta,
+            }
+        )
+        cursor = record["t2"] + delta
+
+    # Move the records before the anchor earlier, until one fits
+    before = []
+    for record in others:
+        if _record_end(record, now) <= anchor["t1"]:
+            before.append(record)
+    before.sort(key=lambda r: -_record_end(r, now))
+    cursor = anchor_t1
+    for record in before:
+        if record["t2"] <= cursor:
+            break
+        delta = record["t2"] - cursor
+        shifted.append(
+            {
+                "key": record["key"],
+                "t1": record["t1"] - delta,
+                "t2": cursor,
+                "delta": -delta,
+            }
+        )
+        cursor = record["t1"] - delta
+
+    shifted.sort(key=lambda s: s["t1"])
+    for s in shifted:
+        plan["max_shift"] = max(plan["max_shift"], abs(s["delta"]))
+    plan["shifted"] = shifted
+    return plan
 
 
 def positions_mean_and_std(positions):
@@ -972,6 +1234,7 @@ class SimpleSettings:
             "report_format": "hm",
             "report_showrecords": True,
             "report_shownotes": True,
+            "report_joinbreaks": True,
         }
         self._synced_keys = {
             "first_day_of_week": 1,
@@ -983,6 +1246,7 @@ class SimpleSettings:
             "today_end_offset": "",
             "show_stopwatch": True,
             "multitask_offer_consolidation": True,
+            "timeline_joinbreaks": True,
         }
         # The data store for synced source
         self._store = None

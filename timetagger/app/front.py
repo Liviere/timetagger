@@ -171,6 +171,7 @@ class TimeTaggerCanvas(BaseCanvas):
         self.record_dialog = dialogs.RecordDialog(self)
         self.switch_dialog = dialogs.SwitchDialog(self)
         self.consolidate_dialog = dialogs.ConsolidateDialog(self)
+        self.merge_dialog = dialogs.MergeDialog(self)
         self.tag_combo_dialog = dialogs.TagComboDialog(self)
         self.tag_dialog = dialogs.TagDialog(self)
         self.report_dialog = dialogs.ReportDialog(self)
@@ -2112,6 +2113,18 @@ class RecordsWidget(Widget):
         # records.sort(key=lambda r: r.t1 - (now if (r.t1 == r.t2) else r.t2))
         records.sort(key=lambda r: -r.t2)
 
+        # Records that are only separated by breaks share one label. But the
+        # records of a series that has a selected record are shown separately.
+        series_list = []
+        series_by_key = {}
+        for series in self._get_break_series(records, t1, t2):
+            if self._selected_record is not None:
+                if self._selected_record[0].key in series.record_keys:
+                    continue
+            series_list.append(series)
+            for key in series.record_keys:
+                series_by_key["key:" + key] = series
+
         # Prepare by collecting stuff per record, and determine selected record
         self._record_times = {}
         positions_map = {}
@@ -2121,10 +2134,18 @@ class RecordsWidget(Widget):
             if self._selected_record is not None:
                 if record.key == self._selected_record[0].key:
                     selected_record = record
+            if series_by_key.get("key:" + record.key, None) is not None:
+                continue  # the label of the series is positioned instead
             pos = self._determine_record_preferred_pos(
                 record, t1, y0, y1, y2, npixels, nsecs
             )
             positions_map[record.key] = pos
+        for series in series_list:
+            span = {"t1": series.t1, "t2": series.t1 if series.running else series.t2}
+            pos = self._determine_record_preferred_pos(
+                span, t1, y0, y1, y2, npixels, nsecs
+            )
+            positions_map["series:" + series.key] = pos
 
         # Organise position objects in a list, and initialize each as a cluster
         positions = positions_map.values()
@@ -2178,12 +2199,29 @@ class RecordsWidget(Widget):
                     for i, pos in enumerate(cluster):
                         pos.y = ref_y + (i + 0.5 - len(cluster) / 2) * distance
 
-        # Draw records
+        # Draw records, and the labels of series (in the same order as the
+        # records, so that labels in a cluster overlap in the same way)
+        items = []
         for record in records:
-            pos = positions_map[record.key]
-            self._draw_one_record(
-                ctx, record, t1, x1, x2, x3, y0, y1, y2, npixels, nsecs, pos.y
-            )
+            items.append({"t2": record.t2, "record": record, "series": None})
+        for series in series_list:
+            items.append({"t2": series.t2, "record": None, "series": series})
+        items.sort(key=lambda item: -item.t2)
+        for item in items:
+            if item.series is not None:
+                pos = positions_map["series:" + item.series.key]
+                self._draw_series_label(
+                    ctx, item.series, t1, x1, x2, x3, y0, y1, y2, npixels, nsecs, pos.y
+                )
+            elif series_by_key.get("key:" + item.record.key, None) is not None:
+                self._draw_one_record(
+                    ctx, item.record, t1, x1, x2, x3, y0, y1, y2, npixels, nsecs, None
+                )
+            else:
+                pos = positions_map[item.record.key]
+                self._draw_one_record(
+                    ctx, item.record, t1, x1, x2, x3, y0, y1, y2, npixels, nsecs, pos.y
+                )
 
         # Draw the selected record, again, and with extra stuff to allow
         # manipulating it. This is mostly for the timeline
@@ -2198,6 +2236,32 @@ class RecordsWidget(Widget):
             self._draw_selected_record_extras(
                 ctx, record, t1, x1, x2, x3, y0, y1, y2, npixels, nsecs
             )
+
+    def _get_break_series(self, records, t1, t2):
+        """Get the series of records that are only separated by breaks (see
+        utils.find_break_series), that have multiple records, of which at
+        least one is in the given records.
+        """
+        if not window.simplesettings.get("timeline_joinbreaks"):
+            return []
+        # Use the records of whole days, so that the series are complete
+        day_t1 = dt.floor(t1, "1D")
+        day_t2 = dt.add(dt.floor(t2, "1D"), "1D")
+        day_records = window.store.records.get_records(day_t1, day_t2).values()
+        day_starts = dialogs.get_day_starts(day_t1, day_t2)
+        now = self._canvas.now()
+        in_range = {}
+        for record in records:
+            in_range["key:" + record.key] = True
+        series_list = []
+        for series in utils.find_break_series(day_records, day_starts, now):
+            if len(series.record_keys) < 2:
+                continue
+            for key in series.record_keys:
+                if in_range.get("key:" + key, False):
+                    series_list.append(series)
+                    break
+        return series_list
 
     def _determine_record_preferred_pos(self, record, t1, y0, y1, y2, npixels, nsecs):
         PSCRIPT_OVERLOAD = False  # noqa
@@ -2234,6 +2298,16 @@ class RecordsWidget(Widget):
 
         return {"pref": pref, "y": y, "visible": visible}
 
+    def _tags_are_selected(self, tags):
+        """Get whether the given tags match the tags selected in the overview."""
+        if self._dragging_new_record:
+            return False
+        selected_tags = self._canvas.widgets.AnalyticsWidget.selected_tags
+        if len(selected_tags):
+            if not all([tag in tags for tag in selected_tags]):
+                return False
+        return True
+
     def _draw_one_record(
         self, ctx, record, t1, x1, x4, x6, y0, y1, y2, npixels, nsecs, yy
     ):
@@ -2266,13 +2340,7 @@ class RecordsWidget(Widget):
         tags, ds_parts = utils.get_tags_and_parts_from_string(record.ds)
         if len(tags) == 0:
             tags = ["#untagged"]
-        tags_selected = True
-        selected_tags = self._canvas.widgets.AnalyticsWidget.selected_tags
-        if len(selected_tags):
-            if not all([tag in tags for tag in selected_tags]):
-                tags_selected = False
-        if self._dragging_new_record:
-            tags_selected = False
+        tags_selected = self._tags_are_selected(tags)
 
         # # Determine wheter this record is selected in the timeline
         # selected_in_timeline = False
@@ -2302,7 +2370,9 @@ class RecordsWidget(Widget):
         rnb = COLORBAND_ROUNDNESS
         rne = min(min(0.5 * (ry2 - ry1), rn), rnb)  # for in timeline
 
-        timeline_only = ry2 < y1 or ry1 > y2
+        # Without yy, only the part in the timeline is drawn (e.g. for a record
+        # that is part of a series, which has one label for all its records)
+        timeline_only = ry2 < y1 or ry1 > y2 or yy is None
 
         # Make the timeline-part clickable - the pick region is increased if needed
         ry1_, ry2_ = ry1, ry2
@@ -2442,20 +2512,140 @@ class RecordsWidget(Widget):
         if timeline_only:
             return
 
+        # Draw the duration and the description
+        duration = record.t2 - record.t1
+        if is_running:
+            duration = now - record.t1
+        has_note = len(record.get("note", "")) > 0
+        self._draw_record_text(
+            ctx,
+            ds_parts,
+            tags_selected,
+            duration,
+            is_running,
+            has_note,
+            x5,
+            x6,
+            ty1,
+            ty2,
+        )
+
+    def _draw_series_label(
+        self, ctx, series, t1, x1, x4, x6, y0, y1, y2, npixels, nsecs, yy
+    ):
+        """Draw the label of a series of records that are only separated by
+        breaks. The label connects to the whole series, and the records
+        themselves are drawn in the timeline separately.
+        """
+        PSCRIPT_OVERLOAD = False  # noqa
+        grid_round = self._canvas.grid_round
+        now = self._canvas.now()
+
+        x5 = x4 + 25
+        ty1 = yy - 20
+        ty2 = yy + 20
+
+        # Get position of the whole series in pixels
+        end = now if series.running else series.t2
+        ry1 = y0 + npixels * (series.t1 - t1) / nsecs
+        ry2 = y0 + npixels * (end - t1) / nsecs
+        if self._round_top_bottom:
+            ry1 = grid_round(ry1)
+            ry2 = grid_round(ry2)
+        if ry2 < y1 or ry1 > y2:
+            return
+
+        tags, ds_parts = utils.get_tags_and_parts_from_string(series.ds)
+        if len(tags) == 0:
+            tags = ["#untagged"]
+        tags_selected = self._tags_are_selected(tags)
+
+        # Make the label clickable, to edit the last record of the series
+        d = {"button": True, "action": "editrecord", "help": "", "key": series.key}
+        self._picker.register(x5, ty1, x6, ty2, d)
+        n = len(series.record_keys)
+        times = dt.time2localstr(series.t1)[11:16] + "–" + dt.time2localstr(end)[11:16]
+        breaks = dt.duration_string(series.breaks, False)
+        tt_text = tags.join(" ") + f"\n{n} parts, {times}, {breaks} of breaks"
+        note = series.note
+        if note:
+            if len(note) > 300:
+                note = note[:300] + "…"
+            tt_text += "\n\n" + note
+        tt_text += "\n(Click to edit the last part)"
+        hover = self._canvas.register_tooltip(x5, ty1, x6, ty2, tt_text)
+
+        # Cast a shadow if hovering
+        rn = RECORD_ROUNDNESS
+        if hover:
+            ctx.beginPath()
+            ctx.arc(x5 + rn, ty2 - rn, rn, 0.5 * PI, 1.0 * PI)
+            ctx.arc(x5 + rn, ty1 + rn, rn, 1.0 * PI, 1.5 * PI)
+            ctx.arc(x6 - rn, ty1 + rn, rn, 1.5 * PI, 2.0 * PI)
+            ctx.arc(x6 - rn, ty2 - rn, rn, 2.0 * PI, 2.5 * PI)
+            ctx.closePath()
+            ctx.shadowBlur = 5
+            ctx.shadowColor = COLORS.button_shadow
+            ctx.fill()
+            ctx.shadowBlur = 0
+
+        # Draw the label, connected to the side of the timeline along the series
+        path = utils.RoundedPath()
+        path.addVertex(x4, ry2, 4)
+        path.addVertex(x4, ry1, 4)
+        path.addVertex(x5, ty1, 4)
+        path.addVertex(x6, ty1, rn)
+        path.addVertex(x6, ty2, rn)
+        path.addVertex(x5, ty2, 4)
+        path = path.toPath2D()
+        ctx.fillStyle = COLORS.record_bg_running if series.running else COLORS.record_bg
+        ctx.fill(path)
+        ctx.strokeStyle = COLORS.record_edge
+        ctx.lineWidth = 1.2
+        ctx.stroke(path)
+
+        has_note = len(series.note) > 0
+        self._draw_record_text(
+            ctx,
+            ds_parts,
+            tags_selected,
+            series.total,
+            series.running,
+            has_note,
+            x5,
+            x6,
+            ty1,
+            ty2,
+        )
+
+    def _draw_record_text(
+        self,
+        ctx,
+        ds_parts,
+        tags_selected,
+        duration,
+        is_running,
+        has_note,
+        x5,
+        x6,
+        ty1,
+        ty2,
+    ):
+        """Draw the duration and the description in the label of a record."""
+        PSCRIPT_OVERLOAD = False  # noqa
+
         text_ypos = ty1 + 0.55 * (ty2 - ty1)
 
         ctx.font = (SMALLER * FONT.size) + "px " + FONT.default
         ctx.textBaseline = "middle"
         faded_clr = COLORS.prim2_clr
 
-        # Draw duration text
-        duration = record.t2 - record.t1
-        if duration > 0:
+        # Draw duration text, with seconds if running
+        if is_running:
+            duration_text, duration_sec = dt.duration_string(duration, 2)
+        else:
             duration_text = dt.duration_string(duration, False)
             duration_sec = ""
-        else:
-            duration = now - record.t1
-            duration_text, duration_sec = dt.duration_string(duration, 2)
         ctx.fillStyle = COLORS.record_text if tags_selected else faded_clr
         ctx.textAlign = "right"
         ctx.fillText(duration_text, x5 + 30, text_ypos)
@@ -2467,7 +2657,6 @@ class RecordsWidget(Widget):
         # Show desciption
         ctx.font = (SMALLER * FONT.size) + "px " + FONT.default
         ctx.textAlign = "left"
-        has_note = len(record.get("note", "")) > 0
         max_x = x6 - 18 if has_note else x6 - 4
         space_width = ctx.measureText(" ").width + 2
         x = x5 + 55
