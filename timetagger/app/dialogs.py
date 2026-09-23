@@ -486,14 +486,16 @@ def _part_option_text(part, n, record, edited):
     return text
 
 
-def _record_rows_html(records, with_date, show_notes):
+def _record_rows_html(records, with_date, show_notes, actions=None):
     """Get the html for the table rows of the given records (or dicts with
     t1, t2, ds and note). Notes are shown in a row of their own, or else as
     an icon after the description. An optional comment is shown after the
-    description.
+    description. Optional actions (html per record) go in a last column.
     """
     html = ""
-    for record in records:
+    ncols = 5 if actions else 4
+    for i in range(len(records)):
+        record = records[i]
         ds_html = _ds_to_html(record.get("ds", ""))
         comment = record.get("comment", "")
         note = record.get("note", "")
@@ -505,10 +507,13 @@ def _record_rows_html(records, with_date, show_notes):
         html += f"""<tr><td>{duration}</td>
             <td class='t1'>{_time_str(record.t1, with_date)}</td>
             <td class='t2'>{_time_str(record.t2, with_date)}</td>
-            <td style='width:100%;'>{ds_html}</td></tr>"""
+            <td style='width:100%;'>{ds_html}</td>"""
+        if actions:
+            html += f"<td class='actions'>{actions[i]}</td>"
+        html += "</tr>"
         if note and show_notes:
             note_html = utils.escape_html(note).replace("\n", "<br>")
-            html += f"<tr class='note_row'><td class='note' colspan='4'>{note_html}</td></tr>"
+            html += f"<tr class='note_row'><td class='note' colspan='{ncols}'>{note_html}</td></tr>"
     return html
 
 
@@ -2722,6 +2727,7 @@ class ConsolidateDialog(BaseDialog):
         self._snapshot = []
         self._applied = False
         self._declined = {}  # signatures of blocks offered but not consolidated
+        self._orders = {}  # signatures of blocks -> order of threads to use
 
     def open(self, key, auto=False, callback=None):
         """Open the dialog for the session of the record with the given key.
@@ -2733,7 +2739,8 @@ class ConsolidateDialog(BaseDialog):
         self._auto = auto
         self._snapshot = []
         self._applied = False
-        self._blocks = get_consolidation_blocks(key, auto)
+        self._orders = {}
+        self._blocks = self._load_blocks()
         if auto:
             blocks = []
             for block in self._blocks:
@@ -2755,6 +2762,19 @@ class ConsolidateDialog(BaseDialog):
     def _signature(self, block):
         parts = [f"{r.key}:{r.t1}:{r.t2}" for r in block.records]
         return "sig:" + "|".join(parts)
+
+    def _load_blocks(self):
+        """Get the blocks of the session, planned with the order of the
+        threads that the user chose for them (if any).
+        """
+        blocks = get_consolidation_blocks(self._key, self._auto)
+        for block in blocks:
+            block.selected = not block.reason
+            order = self._orders.get(self._signature(block), None)
+            if order:
+                note_max = stores.TEXT_MAX - 1
+                block.plan = utils.plan_consolidation(block.records, note_max, order)
+        return blocks
 
     def _render(self, message):
         blocks_html = ""
@@ -2783,7 +2803,8 @@ class ConsolidateDialog(BaseDialog):
         self._submit_but.onclick = self._apply
         checkboxes = self._get_checkboxes()
         for i in range(len(checkboxes)):
-            checkboxes[i].onchange = self._update_buttons
+            checkboxes[i].onchange = self._on_check
+        window._consolidate_dialog_move = self._move
 
         if message:
             self._message_p.innerHTML = message
@@ -2798,6 +2819,12 @@ class ConsolidateDialog(BaseDialog):
                 + "time per thread stays the same, but the start and end times "
                 + "no longer reflect when the work was actually done."
             )
+            for block in self._blocks:
+                if not block.reason and len(block.plan.blocks) >= 2:
+                    self._message_p.innerHTML += (
+                        " Use the arrows to change the order of the threads."
+                    )
+                    break
         self._update_buttons()
 
     def _block_html(self, i, block):
@@ -2813,7 +2840,9 @@ class ConsolidateDialog(BaseDialog):
         summary += f"{plan.n_before} → {plan.n_after} records &nbsp;·&nbsp; "
         summary += dt.duration_string(plan.total, False)
         if len(self._blocks) > 1:
-            state = " disabled" if block.reason else " checked"
+            state = " disabled" if block.reason else ""
+            if block.selected:
+                state = " checked"
             summary = f"<label><input type='checkbox' data-index='{i}'{state}> {summary}</label>"
 
         warnings = []
@@ -2835,7 +2864,19 @@ class ConsolidateDialog(BaseDialog):
             warnings_html += f"<div style='color:#955;'><i class='fas'>\uf071</i>&nbsp; {warning}</div>"
 
         rows_before = _record_rows_html(records, with_date, False)
-        rows_after = _record_rows_html(plan.blocks, with_date, True)
+        actions = None
+        n = len(plan.blocks)
+        if not block.reason and not self._applied and n >= 2:
+            actions = []
+            for j in range(n):
+                up = " disabled" if j == 0 else ""
+                down = " disabled" if j == n - 1 else ""
+                move = f"window._consolidate_dialog_move({i}, {j}, "
+                actions.append(
+                    f"<button type='button' class='orderbutton' title='Move up'{up} onclick='{move}-1)'><i class='fas'>\uf062</i></button>"
+                    + f"<button type='button' class='orderbutton' title='Move down'{down} onclick='{move}1)'><i class='fas'>\uf063</i></button>"
+                )
+        rows_after = _record_rows_html(plan.blocks, with_date, True, actions)
 
         label_style = "margin-top:0.8em; font-size:90%; color:#777;"
         return f"""
@@ -2852,6 +2893,32 @@ class ConsolidateDialog(BaseDialog):
     def _get_checkboxes(self):
         # Note: a NodeList is not an array, so iterate over it using an index
         return self._blocks_div.querySelectorAll("input[type=checkbox]")
+
+    def _on_check(self):
+        checkboxes = self._get_checkboxes()
+        for i in range(len(checkboxes)):
+            index = int(checkboxes[i].getAttribute("data-index"))
+            self._blocks[index].selected = bool(checkboxes[i].checked)
+        self._update_buttons()
+
+    def _move(self, block_index, pos, delta):
+        """Move a thread of a block up (delta -1) or down (delta 1) in the
+        order of the consolidated records, and plan again.
+        """
+        if self._applied:
+            return
+        block = self._blocks[block_index]
+        order = [b.ds for b in block.plan.blocks]
+        other = pos + delta
+        if other < 0 or other >= len(order):
+            return
+        ds = order[pos]
+        order[pos] = order[other]
+        order[other] = ds
+        self._orders[self._signature(block)] = order
+        note_max = stores.TEXT_MAX - 1
+        block.plan = utils.plan_consolidation(block.records, note_max, order)
+        self._render("")
 
     def _get_selected_blocks(self):
         if len(self._blocks) == 1:
@@ -2903,7 +2970,7 @@ class ConsolidateDialog(BaseDialog):
                     or current.t1 != record.t1
                     or current.t2 != record.t2
                 ):
-                    self._blocks = get_consolidation_blocks(self._key, self._auto)
+                    self._blocks = self._load_blocks()
                     self._render("The records have changed. Please review again.")
                     return
 
@@ -2951,6 +3018,9 @@ class ConsolidateDialog(BaseDialog):
         checkboxes = self._get_checkboxes()
         for i in range(len(checkboxes)):
             checkboxes[i].disabled = True
+        order_buttons = self._blocks_div.querySelectorAll("button.orderbutton")
+        for i in range(len(order_buttons)):
+            order_buttons[i].style.display = "none"
         self._message_p.innerHTML = (
             f"Consolidated {n_before} records into {n_after}. "
             + "Use Undo to restore the original records."
@@ -2963,7 +3033,7 @@ class ConsolidateDialog(BaseDialog):
         window.store.records.put(*[record.copy() for record in self._snapshot])
         self._snapshot = []
         self._applied = False
-        self._blocks = get_consolidation_blocks(self._key, self._auto)
+        self._blocks = self._load_blocks()
         self._render("Restored the original records.")
 
 

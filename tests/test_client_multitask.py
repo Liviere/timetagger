@@ -159,6 +159,11 @@ def get_plan_fixtures():
         ("plan_i", "plan_consolidation", [records_i, 4095]),
         ("plan_j", "plan_consolidation", [records_j, 4095]),
         ("plan_empty", "plan_consolidation", [[], 4095]),
+        ("plan_a_ordered", "plan_consolidation", [records_a, 4095, [K, P]]),
+        ("plan_b_partial", "plan_consolidation", [records_b, 4095, ["#b"]]),
+        ("plan_b_unknown", "plan_consolidation", [records_b, 4095, ["#zz"]]),
+        ("plan_g_reversed", "plan_consolidation", [records_g, 4095, [K, P]]),
+        ("plan_i_ordered", "plan_consolidation", [records_i, 4095, ["#a", ""]]),
     ]
 
 
@@ -398,6 +403,32 @@ def test_plan_consolidation_notes_and_ties():
     plan = run_fixture(fixtures, "plan_empty")
     assert plan["blocks"] == [] and plan["hide"] == []
     assert plan["is_noop"] is True
+
+
+def test_plan_consolidation_order():
+    fixtures = get_plan_fixtures()
+
+    # The given order overrides the center of mass; the rest stays the same
+    plan = run_fixture(fixtures, "plan_a_ordered")
+    assert block_times(plan) == [("k1", 0, 24600), ("p1", 24600, 27000)]
+    assert [b["note"] for b in plan["blocks"]] == ["etap 1\netap 2", "ticket 42"]
+    assert plan["hide"] == ["k2", "p2", "k3"]
+    assert plan["total"] == 27000
+
+    # Threads that are not in the order follow in the default order
+    plan = run_fixture(fixtures, "plan_b_partial")
+    assert block_times(plan) == [("b1", 0, 1500), ("a1", 1500, 3000)]
+    plan = run_fixture(fixtures, "plan_b_unknown")
+    assert block_times(plan) == [("a1", 0, 1500), ("b1", 1500, 3000)]
+
+    # Reordering already consolidated records is a change
+    plan = run_fixture(fixtures, "plan_g_reversed")
+    assert block_times(plan) == [("k1", 0, 24600), ("p1", 24600, 27000)]
+    assert plan["is_noop"] is False
+
+    # Records without description can be ordered too
+    plan = run_fixture(fixtures, "plan_i_ordered")
+    assert block_times(plan) == [("a", 0, 600), ("r1", 600, 1800)]
 
 
 def test_list_session_threads():

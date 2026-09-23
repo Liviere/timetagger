@@ -541,7 +541,7 @@ def split_chain_into_blocks(chain, now):
     return blocks
 
 
-def plan_consolidation(records, note_max):
+def plan_consolidation(records, note_max, order=None):
     """Plan the consolidation of a block of finished records into one
     contiguous record per thread (i.e. per description).
 
@@ -551,6 +551,9 @@ def plan_consolidation(records, note_max):
     duration while moving as little as possible. Gaps move to the end. For
     each thread the first record is kept (with new times and the merged
     notes), and the others are to be hidden.
+
+    An optional order (a list of descriptions) overrides the order of the
+    threads; threads that it does not contain follow in the default order.
     """
     items = _sorted_records(records, 0)
     n = len(items)
@@ -635,6 +638,17 @@ def plan_consolidation(records, note_max):
         else:
             plan["removed"].append(group["ds"])
     live_groups.sort(key=lambda g: g["mass"] / g["total"])
+    if order:
+        ranks = {}
+        for i in range(len(order)):
+            if ("ds:" + order[i]) not in ranks:
+                ranks["ds:" + order[i]] = i
+        for group in live_groups:
+            rank = len(order)
+            if ("ds:" + group["ds"]) in ranks:
+                rank = ranks["ds:" + group["ds"]]
+            group["rank"] = rank
+        live_groups.sort(key=lambda g: g["rank"])
 
     # Pack the threads into contiguous blocks
     t = base
